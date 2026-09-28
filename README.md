@@ -82,7 +82,7 @@ result.code 语义：200 成功 / 202 已受理（结果走 Event.Result）/ 400
 | XNode.Bridge / ChannelBridge | 桥接两条通道 |
 | XNode.SetVar / GetVar / GetState / GetChannelData | 变量与状态读写 |
 | XNode.Dial | 外呼（switch_ivr_originate 直调，无命令拼接注入面；立即回 202 + job_uuid，结果走 Event.Result 且携带原始 rpc id；主叫控制器即刻拥有 b-leg） |
-| XNode.JStatus | 节点状态：sessions/peak/sps/uptime/version |
+| XNode.JStatus | 节点状态：sessions/peak/max/sps/uptime/version + 系统指标 |
 | XNode.NativeApp / NativeAPI / NativeJSAPI | 逃生舱：任意 dialplan app / fs API / JSON API |
 | Event.Channel / Event.CDR / Event.Result / Event.Metrics | 事件、异步结果与节点心跳 |
 

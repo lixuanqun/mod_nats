@@ -554,10 +554,11 @@ static void add_system_metrics(cJSON *data)
 /* node status payload shared by XNode.JStatus and the metrics heartbeat */
 cJSON *mod_nats_methods_node_status(void)
 {
-	int sessions_peak = 0, sps = 0, sps_peak = 0;
+	int sessions_peak = 0, sps = 0, sps_peak = 0, max_sessions = 0;
 	cJSON *data;
 
 	switch_core_session_ctl(SCSC_SESSIONS_PEAK, &sessions_peak);
+	switch_core_session_ctl(SCSC_MAX_SESSIONS, &max_sessions);
 	switch_core_session_ctl(SCSC_SPS, &sps);
 	switch_core_session_ctl(SCSC_SPS_PEAK, &sps_peak);
 
@@ -567,6 +568,7 @@ cJSON *mod_nats_methods_node_status(void)
 	cJSON_AddStringToObject(data, "version", switch_version_full());
 	cJSON_AddNumberToObject(data, "sessions", (double) switch_core_session_count());
 	cJSON_AddNumberToObject(data, "sessions_peak", (double) sessions_peak);
+	cJSON_AddNumberToObject(data, "sessions_max", (double) max_sessions);
 	cJSON_AddNumberToObject(data, "sps", (double) sps);
 	cJSON_AddNumberToObject(data, "sps_peak", (double) sps_peak);
 #ifdef __linux__
