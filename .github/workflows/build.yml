@@ -53,8 +53,9 @@ jobs:
           DEST=/tmp/freeswitch/src/mod/event_handlers/mod_nats
           mkdir -p "$DEST"
           cp mod_nats.c mod_nats.h nats_conn.c nats_proto.c nats_methods.c nats_events.c Makefile.am "$DEST"/
-          sed -i 's|^#event_handlers/mod_nats$|event_handlers/mod_nats|' /tmp/freeswitch/build/modules.conf.in
-          grep -n 'mod_nats' /tmp/freeswitch/build/modules.conf.in
+          # upstream modules.conf.in has no entry for this module - append it
+          echo 'event_handlers/mod_nats' >> /tmp/freeswitch/build/modules.conf.in
+          tail -3 /tmp/freeswitch/build/modules.conf.in
 
       - name: Bootstrap and configure FreeSWITCH
         run: |

@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""
+mod_nats full self-test: every XNode.* method, error codes, and every event
+type. Drives FreeSWITCH channels via the NATS bus only (no ESL involved).
+
+Usage: python3 selftest.py   (expects FS + nats-server already running)
+"""
+import asyncio
+import json
+import sys
+import time
+import uuid as uuidlib
+
+NATS_URL = "nats://127.0.0.1:4222"
+PREFIX = "nats.fs."
+NODE = "test-node-01"
+CTRL = "test-ctrl-01"
+NODE_SUBJECT = f"{PREFIX}node.{NODE}"
+CTRL_SUBJECT = f"{PREFIX}ctrl.{CTRL}"
+
+results = []          # (name, ok, detail)
+events = []           # every notification seen on nats.fs.>
+ctrl_msgs = []        # messages on the controller mailbox
+
+
+def check(name, ok, detail=""):
+    results.append((name, bool(ok), detail))
+    print(f"{'PASS' if ok else 'FAIL'}  {name}  {detail}")
+
+
+def find_event(method, **conds):
+    """first event matching method + field conditions"""
+    for subj, msg in events:
+        if msg.get("method") != method:
+            continue
+        p = msg.get("params", {})
+        if all(str(p.get(k)) == str(v) for k, v in conds.items()):
+            return subj, msg
+    return None
+
+
+class Client:
+    def __init__(self, nc):
+        self.nc = nc
+        self.rid = 0
+
+    async def req(self, method, params=None, expect=None, timeout=8):
+        self.rid += 1
+        rid = f"t{self.rid}"
+        env = {"jsonrpc": "2.0", "id": rid, "method": method, "params": params or {}}
+        try:
+            reply = await self.nc.request(NODE_SUBJECT, json.dumps(env).encode(), timeout=timeout)
+            out = json.loads(reply.data.decode())
+        except Exception as e:
+            check(f"{method} request", False, f"no reply: {e}")
+            return None
+        return out
+
+    async def req_code(self, method, params, expect_code, name=None):
+        out = await self.req(method, params)
+        if out is None:
+            return None
+        code = out.get("result", {}).get("code")
+        check(name or f"{method} -> {expect_code}", code == expect_code,
+              f"code={code} msg={out.get('result', {}).get('message')}")
+        return out
+
+
+async def originate_parked(cli, tag):
+    """create a parked channel via XNode.NativeAPI originate; returns uuid"""
+    u = str(uuidlib.uuid4())
+    out = await cli.req("XNode.NativeAPI", {
+        "cmd": "originate",
+        "args": f"{{origination_uuid={u},ignore_early_media=true}}loopback/1000 &park",
+    })
+    if out is None:
+        return None
+    data = out.get("result", {}).get("data", "")
+    ok = isinstance(data, str) and "+OK" in data
+    check(f"originate parked channel ({tag})", ok, data[:80] if isinstance(data, str) else data)
+    return u if ok else None
+
+
+async def wait_for(pred, timeout=5.0, step=0.1):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pred():
+            return True
+        await asyncio.sleep(step)
+    return False
+
+
+async def main():
+    import nats
+
+    nc = await nats.connect(NATS_URL)
+
+    async def collector(msg):
+        try:
+            data = json.loads(msg.data.decode())
+        except Exception:
+            return
+        if msg.subject.startswith(f"{PREFIX}event."):
+            events.append((msg.subject, data))
+        if msg.subject == CTRL_SUBJECT:
+            ctrl_msgs.append((msg.subject, data))
+
+    await nc.subscribe(f"{PREFIX}event.>", cb=collector)
+    await nc.subscribe(CTRL_SUBJECT, cb=collector)
+    cli = Client(nc)
+    await asyncio.sleep(0.3)
+
+    print("== basic node methods ==")
+    out = await cli.req_code("XNode.JStatus", {}, 200, "XNode.JStatus -> 200")
+    if out:
+        d = out.get("result", {}).get("data", {})
+        check("JStatus fields", isinstance(d, dict) and "sessions" in d and "version" in d,
+              f"sessions={d.get('sessions')} version={d.get('version')}")
+
+    out = await cli.req_code("XNode.NativeAPI", {"cmd": "status"}, 200, "XNode.NativeAPI(status) -> 200")
+    if out:
+        check("NativeAPI status data", "session" in str(out.get("result", {}).get("data", "")), "")
+
+    out = await cli.req_code("XNode.NativeJSAPI", {"cmd": "status"}, 200, "XNode.NativeJSAPI(status) -> 200")
+
+    print("== channel A lifecycle ==")
+    ua = await originate_parked(cli, "A")
+    if not ua:
+        await finish(1)
+    await asyncio.sleep(0.5)
+    check("Event.Channel START(A)", find_event("Event.Channel", uuid=ua, state="START") is not None, ua[:12])
+
+    await cli.req_code("XNode.Accept", {"uuid": ua, "ctrl_uuid": CTRL}, 200, "XNode.Accept(A) -> 200")
+    out = await cli.req_code("XNode.Accept", {"uuid": ua, "ctrl_uuid": "other-ctrl"}, 419,
+                             "XNode.Accept(A,2nd ctrl) -> 419")
+
+    await cli.req_code("XNode.GetState", {"uuid": ua}, 200, "XNode.GetState(A) -> 200")
+    await cli.req_code("XNode.SetVar", {"uuid": ua, "data": {"test_var": "hello-nats"}}, 200,
+                       "XNode.SetVar(A,test_var) -> 200")
+    out = await cli.req_code("XNode.GetVar", {"uuid": ua, "data": ["test_var"]}, 200, "XNode.GetVar(A) -> 200")
+    if out:
+        val = out.get("result", {}).get("data", {}).get("test_var")
+        check("GetVar value roundtrip", val == "hello-nats", f"test_var={val}")
+    out = await cli.req_code("XNode.GetChannelData", {"uuid": ua}, 200, "XNode.GetChannelData(A) -> 200")
+    if out:
+        check("GetChannelData uuid", out.get("result", {}).get("data", {}).get("uuid") == ua, "")
+
+    # force state transitions via the escape hatch
+    await cli.req_code("XNode.NativeApp", {"uuid": ua, "cmd": "ring_ready"}, 200,
+                       "XNode.NativeApp(A,ring_ready) -> 200")
+    check("Event RINGING(A)", await wait_for(lambda: find_event("Event.Channel", uuid=ua, state="RINGING")),
+          "CHANNEL_PROGRESS")
+    await cli.req_code("XNode.NativeApp", {"uuid": ua, "cmd": "pre_answer"}, 200,
+                       "XNode.NativeApp(A,pre_answer) -> 200")
+    check("Event MEDIA(A)", await wait_for(lambda: find_event("Event.Channel", uuid=ua, state="MEDIA")),
+          "CHANNEL_PROGRESS_MEDIA")
+
+    await cli.req_code("XNode.Answer", {"uuid": ua}, 200, "XNode.Answer(A) -> 200")
+    check("Event ANSWERED(A)", await wait_for(lambda: find_event("Event.Channel", uuid=ua, state="ANSWERED")), "")
+
+    tone = "tone_stream://%(2000,0,440,480)"
+    await cli.req_code("XNode.Play", {"uuid": ua, "media": {"type": "FILE", "file": tone}}, 200,
+                       "XNode.Play(A,tone) -> 200")
+    await asyncio.sleep(0.5)
+    await cli.req_code("XNode.Stop", {"uuid": ua}, 200, "XNode.Stop(A) -> 200")
+    await cli.req_code("XNode.Broadcast", {"uuid": ua, "option": "ALEG", "file": tone}, 200,
+                       "XNode.Broadcast(A) -> 200")
+    await asyncio.sleep(0.5)
+    await cli.req_code("XNode.Stop", {"uuid": ua}, 200, "XNode.Stop(A) after broadcast -> 200")
+
+    print("== bridge A<->B ==")
+    ub = await originate_parked(cli, "B")
+    if ub:
+        await cli.req_code("XNode.Answer", {"uuid": ub}, 200, "XNode.Answer(B) -> 200")
+        await cli.req_code("XNode.Bridge", {"uuid": ua, "peer_uuid": ub}, 200, "XNode.Bridge(A,B) -> 200")
+        check("Event BRIDGE", await wait_for(lambda: find_event("Event.Channel", uuid=ua, state="BRIDGE")
+                                             or find_event("Event.Channel", uuid=ub, state="BRIDGE")), "")
+
+        await cli.req_code("XNode.Hangup", {"uuid": ua, "cause": "NORMAL_CLEARING"}, 200,
+                           "XNode.Hangup(A) -> 200")
+        check("Event UNBRIDGE(B)", await wait_for(lambda: find_event("Event.Channel", uuid=ub, state="UNBRIDGE")), "")
+        check("Event DESTROY(A)", await wait_for(lambda: find_event("Event.Channel", uuid=ua, state="DESTROY")), "")
+        check("Event CDR(A)", await wait_for(lambda: find_event("Event.CDR", uuid=ua)), "")
+        await cli.req_code("XNode.Hangup", {"uuid": ub}, 200, "XNode.Hangup(B) -> 200")
+        await asyncio.sleep(0.5)
+        check("Event CDR(B)", find_event("Event.CDR", uuid=ub) is not None, "")
+
+    print("== XNode.Dial (async originate) ==")
+    uc = str(uuidlib.uuid4())
+    out = await cli.req_code("XNode.Dial", {
+        "ctrl_uuid": CTRL,
+        "destination": {"call_params": [{
+            "uuid": uc,
+            "dial_string": "loopback/1000",
+            "cid_number": "10000210",
+            "cid_name": "SelfTest",
+        }]},
+    }, 200, "XNode.Dial -> accepted")
+    if out:
+        r = out.get("result", {})
+        check("Dial returns 202 + job_uuid", r.get("code") == 202 and r.get("job_uuid"),
+              f"code={r.get('code')} job_uuid={str(r.get('job_uuid'))[:12]}")
+        check("Event START(C)", await wait_for(lambda: find_event("Event.Channel", uuid=uc, state="START"), 10), uc[:12])
+        check("Event.Result on ctrl mailbox", await wait_for(
+            lambda: any(m.get("method") == "Event.Result" and m.get("params", {}).get("job_uuid") == r.get("job_uuid")
+                        for _, m in ctrl_msgs), 10), "")
+        await cli.req_code("XNode.Hangup", {"uuid": uc}, 200, "XNode.Hangup(C) -> 200")
+
+    print("== ctrl mailbox routing ==")
+    check("A events routed to ctrl mailbox", any(
+        m.get("method") == "Event.Channel" and m.get("params", {}).get("uuid") == ua for _, m in ctrl_msgs), "")
+
+    print("== error paths ==")
+    bogus = str(uuidlib.uuid4())
+    await cli.req_code("XNode.GetState", {"uuid": bogus}, 404, "bogus uuid -> 404")
+    await cli.req_code("XNode.Answer", {}, 400, "missing uuid -> 400")
+    out = await cli.req("XNode.NoSuchMethod", {})
+    if out:
+        check("unknown method -> 501", out.get("result", {}).get("code") == 501, str(out.get("result")))
+
+    await finish(0)
+
+
+async def finish(code):
+    print("\n================ SUMMARY ================")
+    passed = sum(1 for _, ok, _ in results if ok)
+    for name, ok, detail in results:
+        print(f"  {'PASS' if ok else 'FAIL':4}  {name}")
+    print(f"\n{passed}/{len(results)} checks passed")
+    # observed event states
+    states = sorted({m.get("params", {}).get("state") for _, m in events if m.get("method") == "Event.Channel"})
+    methods = sorted({m.get("method") for _, m in events})
+    print(f"observed Event.Channel states: {states}")
+    print(f"observed notification methods: {methods}")
+    fails = [n for n, ok, _ in results if not ok]
+    sys.exit(0 if not fails and code == 0 else 1)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
