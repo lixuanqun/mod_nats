@@ -106,11 +106,18 @@ static void on_node_message(natsConnection *nc, natsSubscription *sub, natsMsg *
 	}
 
 	if (switch_queue_trypush(mod_nats_globals.req_queue, req) != SWITCH_STATUS_SUCCESS) {
-		/* request backlog full: drop rather than stall the cnats dispatcher */
+		/* request backlog full: reply 503 instead of letting the client time out */
 		switch_mutex_lock(mod_nats_globals.mutex);
 		mod_nats_globals.msgs_dropped++;
 		switch_mutex_unlock(mod_nats_globals.mutex);
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, MOD_NATS_NAME " request queue full, message dropped\n");
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, MOD_NATS_NAME " request queue full, replying 503\n");
+		if (!zstr(reply)) {
+			mod_nats_proto_send_error(reply, "", 503, "request queue full");
+		}
+		switch_safe_free(req->subject);
+		switch_safe_free(req->reply);
+		switch_safe_free(req->payload);
+		switch_safe_free(req);
 	}
 
 	natsMsg_Destroy(msg);

@@ -226,16 +226,18 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_nats_load)
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_nats_shutdown)
 {
 	int i;
+	switch_status_t join_status;
 
 	mod_nats_globals.running = SWITCH_FALSE;
 	mod_nats_events_stop();
 	switch_queue_interrupt_all(mod_nats_globals.req_queue);
 	switch_queue_interrupt_all(mod_nats_globals.pub_queue);
+	/* apr_thread_join dereferences retval unconditionally - never pass NULL */
 	for (i = 0; i < mod_nats_globals.req_thread_count; i++) {
-		switch_thread_join(NULL, mod_nats_globals.req_threads[i]);
+		switch_thread_join(&join_status, mod_nats_globals.req_threads[i]);
 	}
 	if (mod_nats_globals.pub_thread) {
-		switch_thread_join(NULL, mod_nats_globals.pub_thread);
+		switch_thread_join(&join_status, mod_nats_globals.pub_thread);
 	}
 	/* connection last: all publisher threads have stopped by now.
 	 * NOTE: nats_Close() is a one-shot global library teardown and must NOT

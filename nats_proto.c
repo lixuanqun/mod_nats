@@ -60,7 +60,7 @@ void mod_nats_proto_send_reply(const char *reply, const char *rpc_id, cJSON *res
 	cJSON *env;
 	char *payload;
 
-	if (zstr(reply) || zstr(rpc_id) || !result) {
+	if (zstr(reply) || !result) {
 		if (result) {
 			cJSON_Delete(result);
 		}
@@ -69,7 +69,12 @@ void mod_nats_proto_send_reply(const char *reply, const char *rpc_id, cJSON *res
 
 	env = cJSON_CreateObject();
 	cJSON_AddStringToObject(env, "jsonrpc", "2.0");
-	cJSON_AddStringToObject(env, "id", rpc_id);
+	if (zstr(rpc_id)) {
+		/* JSON-RPC 2.0: unknown request id is reported as null */
+		cJSON_AddNullToObject(env, "id");
+	} else {
+		cJSON_AddStringToObject(env, "id", rpc_id);
+	}
 	cJSON_AddItemToObject(env, "result", result);
 
 	payload = cJSON_PrintUnformatted(env);

@@ -191,8 +191,11 @@ static void handle_cdr_event(switch_event_t *event)
 		{"Caller-Direction", "direction"},
 		{"Caller-Context", "context"},
 		{"Hangup-Cause", "hangup_cause"},
-		{"Caller-Channel-Created-Date", "start_stamp"},
-		{"Caller-Channel-Hangup-Date", "end_stamp"},
+		{"variable_duration", "duration"},
+		{"variable_billsec", "billsec"},
+		{"variable_start_stamp", "start_stamp"},
+		{"variable_answer_stamp", "answer_stamp"},
+		{"variable_end_stamp", "end_stamp"},
 		{NULL, NULL}
 	};
 	int i;
@@ -208,7 +211,9 @@ static void handle_cdr_event(switch_event_t *event)
 	cdr = cJSON_CreateObject();
 	for (i = 0; keys[i][0]; i++) {
 		const char *val = switch_event_get_header(event, keys[i][0]);
-		cJSON_AddStringToObject(cdr, keys[i][1], switch_str_nil(val));
+		if (!zstr(val)) {
+			cJSON_AddStringToObject(cdr, keys[i][1], val);
+		}
 	}
 	cJSON_AddItemToObject(params, "cdr", cdr);
 

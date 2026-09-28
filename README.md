@@ -150,6 +150,7 @@ nats sub 'nats.fs.event.cdr'
 ## 7. 已知限制（v0.1）
 
 - XNode.Dial 的 Event.Result 目前不带原始 rpc id，用 `job_uuid` 关联；
+- 非法 JSON 请求按 JSON-RPC 2.0 规范回 `id:null` 错误；请求队列满时回 503（v0.1.2）；
 - Accept 无"10 秒无人接管挂机"逻辑（XCC 语义），来话需 dialplan 配合 park；
 - 未在所有平台编译验证，首次编译可能需修正个别 API 签名差异；
 - Windows 工程（.vcxproj）未创建（建议 vcpkg 安装 nats.c）。
