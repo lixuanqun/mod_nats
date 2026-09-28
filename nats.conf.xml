@@ -1,0 +1,28 @@
+<configuration name="nats.conf" description="NATS Bus">
+  <settings>
+    <!-- comma separated URLs, client fails over automatically -->
+    <param name="urls" value="nats://127.0.0.1:4222"/>
+    <!-- subject prefix; set to "cn.xswitch." for drop-in compatibility with
+         the official xctrl Go SDK / proto Java SDK -->
+    <param name="subject-prefix" value="nats.fs."/>
+    <!-- node id; random UUID per load when empty (set a fixed one in production) -->
+    <param name="node-uuid" value=""/>
+    <!-- auth: user/password or JWT credentials file -->
+    <param name="user" value="fs"/>
+    <param name="password" value="secret"/>
+    <!-- <param name="credentials" value="/etc/freeswitch/nats.creds"/> -->
+
+    <param name="publish-events" value="true"/>
+    <param name="enable-cdr" value="true"/>
+    <!-- forward all native FS events (off by default; careful on high-CPS nodes) -->
+    <param name="publish-native-events" value="false"/>
+    <!-- extra channel variables to include in Event.Channel (comma separated) -->
+    <param name="channel-params" value="hangup_cause,sip_from_user"/>
+    <!-- dedicated CDR subject, default is {prefix}event.cdr -->
+    <param name="cdr-subject" value=""/>
+
+    <param name="workers" value="4"/>
+    <param name="pub-qsize" value="8192"/>
+    <param name="req-qsize" value="2048"/>
+  </settings>
+</configuration>
