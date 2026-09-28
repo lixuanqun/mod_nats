@@ -26,7 +26,7 @@ jobs:
       - name: Install libnats build tools
         run: |
           # the CI base image carries SignalWire's token-gated apt repo; drop it
-          rm -f /etc/apt/sources.list.d/*signalwire*.list /etc/apt/sources.list.d/*signalwire*.sources || true
+          grep -rl 'freeswitch.signalwire.com' /etc/apt/sources.list.d/ /etc/apt/sources.list 2>/dev/null | xargs -r rm -f
           apt-get update
           apt-get install -y --no-install-recommends cmake ca-certificates
 
