@@ -44,6 +44,19 @@ jobs:
           ldconfig
           echo "libnats version: $(pkg-config --modversion libnats || pkg-config --modversion nats)"
 
+      - name: Build FreeSWITCH core deps (sofia-sip, spandsp)
+        run: |
+          for repo in sofia-sip spandsp; do
+            git clone --depth 1 https://github.com/freeswitch/$repo /tmp/$repo
+            cd /tmp/$repo
+            ./bootstrap.sh
+            ./configure --prefix=/usr/local
+            make -j"$(nproc)"
+            make install
+          done
+          ldconfig
+          pkg-config --modversion sofia-sip-ua spandsp
+
       - name: Fetch FreeSWITCH source
         run: |
           git clone --depth 1 --branch "$FREESWITCH_REF" https://github.com/signalwire/freeswitch /tmp/freeswitch
@@ -55,6 +68,8 @@ jobs:
           cp mod_nats.c mod_nats.h nats_conn.c nats_proto.c nats_methods.c nats_events.c Makefile.am "$DEST"/
           # upstream modules.conf.in has no entry for this module - append it
           echo 'event_handlers/mod_nats' >> /tmp/freeswitch/build/modules.conf.in
+          # avoid the libks dependency tree in CI
+          sed -i -e 's|^endpoints/mod_verto$|#endpoints/mod_verto|' -e 's|^\(.*mod_signalwire\)$|#\1|' /tmp/freeswitch/build/modules.conf.in
           # FS hardcodes the per-module Makefile list in AC_CONFIG_FILES
           sed -i 's|^\tsrc/mod/event_handlers/mod_event_socket/Makefile$|\tsrc/mod/event_handlers/mod_event_socket/Makefile\n\tsrc/mod/event_handlers/mod_nats/Makefile|' /tmp/freeswitch/configure.ac
           grep -n 'mod_nats' /tmp/freeswitch/build/modules.conf.in /tmp/freeswitch/configure.ac
