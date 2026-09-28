@@ -11,23 +11,29 @@
  */
 #include "mod_nats.h"
 
+#ifdef _MSC_VER
+#define MOD_NATS_TLS __declspec(thread)
+#else
+#define MOD_NATS_TLS __thread
+#endif
+
 const char *mod_nats_subject_node(void)
 {
-	static char buf[MOD_NATS_PREFIX_MAX + SWITCH_UUID_FORMATTED_LENGTH + 16];
+	static MOD_NATS_TLS char buf[MOD_NATS_PREFIX_MAX + SWITCH_UUID_FORMATTED_LENGTH + 16];
 	snprintf(buf, sizeof(buf), "%snode.%s", mod_nats_globals.subject_prefix, mod_nats_globals.node_uuid);
 	return buf;
 }
 
 const char *mod_nats_subject_ctrl(const char *ctrl_uuid)
 {
-	static char buf[MOD_NATS_PREFIX_MAX + SWITCH_UUID_FORMATTED_LENGTH + 16];
+	static MOD_NATS_TLS char buf[MOD_NATS_PREFIX_MAX + SWITCH_UUID_FORMATTED_LENGTH + 16];
 	snprintf(buf, sizeof(buf), "%sctrl.%s", mod_nats_globals.subject_prefix, switch_str_nil(ctrl_uuid));
 	return buf;
 }
 
 const char *mod_nats_subject_event(const char *event_name)
 {
-	static char buf[MOD_NATS_PREFIX_MAX + 128];
+	static MOD_NATS_TLS char buf[MOD_NATS_PREFIX_MAX + 128];
 	snprintf(buf, sizeof(buf), "%sevent.%s", mod_nats_globals.subject_prefix, switch_str_nil(event_name));
 	return buf;
 }
@@ -183,9 +189,12 @@ void mod_nats_proto_handle_request(mod_nats_req_t *req)
 		/* method extras override defaults (e.g. Dial's code 202 + job_uuid) */
 		while (extra && extra->child && (item = cJSON_DetachItemViaPointer(extra, extra->child)) != NULL) {
 			if (!zstr(item->string) && cJSON_GetObjectItem(result, item->string)) {
-				cJSON_ReplaceItemInObject(result, item->string, item);
-			} else {
+				cJSON_DeleteItemFromObject(result, item->string);
+			}
+			if (!zstr(item->string)) {
 				cJSON_AddItemToObject(result, item->string, item);
+			} else {
+				cJSON_Delete(item);
 			}
 		}
 		mod_nats_proto_send_reply(req->reply, rpc_id, result);

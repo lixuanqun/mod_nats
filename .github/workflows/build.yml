@@ -42,7 +42,7 @@ jobs:
           cmake --build /tmp/nats.c/build --parallel
           cmake --install /tmp/nats.c/build
           ldconfig
-          echo "libnats version: $(pkg-config --modversion nats)"
+          echo "libnats version: $(pkg-config --modversion libnats || pkg-config --modversion nats)"
 
       - name: Fetch FreeSWITCH source
         run: |
@@ -55,7 +55,9 @@ jobs:
           cp mod_nats.c mod_nats.h nats_conn.c nats_proto.c nats_methods.c nats_events.c Makefile.am "$DEST"/
           # upstream modules.conf.in has no entry for this module - append it
           echo 'event_handlers/mod_nats' >> /tmp/freeswitch/build/modules.conf.in
-          tail -3 /tmp/freeswitch/build/modules.conf.in
+          # FS hardcodes the per-module Makefile list in AC_CONFIG_FILES
+          sed -i 's|^\tsrc/mod/event_handlers/mod_event_socket/Makefile$|\tsrc/mod/event_handlers/mod_event_socket/Makefile\n\tsrc/mod/event_handlers/mod_nats/Makefile|' /tmp/freeswitch/configure.ac
+          grep -n 'mod_nats' /tmp/freeswitch/build/modules.conf.in /tmp/freeswitch/configure.ac
 
       - name: Bootstrap and configure FreeSWITCH
         run: |

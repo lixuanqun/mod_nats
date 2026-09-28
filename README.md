@@ -104,7 +104,11 @@ cp -r mod_nats /path/to/freeswitch/src/mod/event_handlers/
 # 3) build/modules.conf.in 取消注释
 sed -i 's/#event_handlers\/mod_nats/event_handlers\/mod_nats/' /path/to/freeswitch/build/modules.conf.in
 
-# 4) 编译（Makefile.am 通过 pkg-config 自动发现 libnats，无需改 configure.ac）
+# 4) configure.ac 的 AC_CONFIG_FILES 里加一行（新模块必须，FS 硬编码模块清单）：
+#    在 src/mod/event_handlers/mod_event_socket/Makefile 后面加
+#    src/mod/event_handlers/mod_nats/Makefile
+
+# 5) 编译（Makefile.am 通过 pkg-config 自动发现 libnats）
 cd /path/to/freeswitch
 autoreconf -i
 ./configure

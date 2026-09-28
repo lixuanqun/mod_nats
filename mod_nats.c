@@ -47,10 +47,9 @@ static switch_status_t config_load(switch_bool_t reload)
 {
 	switch_xml_t cfg, xml, settings, param;
 	const char *val;
-	switch_uuid_t uuid;
 
 	if (!(xml = switch_xml_open_cfg("nats.conf", &cfg, NULL))) {
-		switch_log_printf(SWITCH_LOG_ID_ALL, SWITCH_LOG_ERROR, MOD_NATS_NAME " cannot open nats.conf.xml\n");
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, MOD_NATS_NAME " cannot open nats.conf.xml\n");
 		return SWITCH_STATUS_FALSE;
 	}
 
@@ -100,7 +99,7 @@ static switch_status_t config_load(switch_bool_t reload)
 	switch_xml_free(xml);
 
 	if (zstr(mod_nats_globals.node_uuid)) {
-		switch_uuid_str(mod_nats_globals.node_uuid, &uuid);
+		switch_uuid_str(mod_nats_globals.node_uuid, sizeof(mod_nats_globals.node_uuid));
 	}
 
 	if (mod_nats_globals.workers < 1) mod_nats_globals.workers = MOD_NATS_DEFAULT_WORKERS;
@@ -199,25 +198,25 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_nats_load)
 	switch_console_set_complete("add nats reload");
 
 	if ((status = mod_nats_conn_start()) != SWITCH_STATUS_SUCCESS) {
-		switch_log_printf(SWITCH_LOG_ID_ALL, SWITCH_LOG_ERROR, MOD_NATS_NAME " connection failed; module not loaded\n");
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, MOD_NATS_NAME " connection failed; module not loaded\n");
 		return SWITCH_STATUS_FALSE;
 	}
 
 	for (i = 0; i < mod_nats_globals.workers; i++) {
 		switch_threadattr_create(&thd_attr, pool);
 		switch_threadattr_stacksize_set(thd_attr, SWITCH_THREAD_STACKSIZE);
-		switch_threadattr_detach_set(thd_attr, 1);
+		/* joinable: the shutdown path joins worker threads */
 		if (switch_thread_create(&mod_nats_globals.req_threads[i], thd_attr, request_worker, NULL, pool) == SWITCH_STATUS_SUCCESS) {
 			mod_nats_globals.req_thread_count++;
 		}
 	}
 
 	if ((status = mod_nats_events_start()) != SWITCH_STATUS_SUCCESS) {
-		switch_log_printf(SWITCH_LOG_ID_ALL, SWITCH_LOG_ERROR, MOD_NATS_NAME " event bind failed\n");
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, MOD_NATS_NAME " event bind failed\n");
 		return SWITCH_STATUS_FALSE;
 	}
 
-	switch_log_printf(SWITCH_LOG_ID_ALL, SWITCH_LOG_INFO,
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
 					  MOD_NATS_NAME " loaded: proto=%s workers=%d listen=%s\n",
 					  MOD_NATS_PROTO_VERSION, mod_nats_globals.req_thread_count, mod_nats_subject_node());
 
@@ -238,8 +237,11 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_nats_shutdown)
 	if (mod_nats_globals.pub_thread) {
 		switch_thread_join(NULL, mod_nats_globals.pub_thread);
 	}
+	/* connection last: all publisher threads have stopped by now.
+	 * NOTE: nats_Close() is a one-shot global library teardown and must NOT
+	 * run here - a reload re-initializes the library immediately after and
+	 * the race crashes FreeSWITCH intermittently. OS reclaims at exit. */
 	mod_nats_conn_stop();
-	nats_Close();
 
 	switch_safe_free(mod_nats_globals.user);
 	switch_safe_free(mod_nats_globals.password);

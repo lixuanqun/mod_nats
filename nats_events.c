@@ -176,14 +176,24 @@ static void handle_channel_event(switch_event_t *event)
 	}
 }
 
+/* v0.1: FS core no longer fires a dedicated CDR event; synthesize one from
+ * CHANNEL_HANGUP_COMPLETE headers. Full CDRs belong to JetStream consumers
+ * via mod_cdr-style modules later. */
 static void handle_cdr_event(switch_event_t *event)
 {
 	cJSON *params, *cdr;
 	const char *uuid = switch_event_get_header(event, "Unique-ID");
-	static const char *keys[] = {
-		"caller_id_name", "caller_id_number", "destination_number", "direction",
-		"start_stamp", "answer_stamp", "end_stamp", "duration", "billsec",
-		"uuid", "bleg_uuid", "hangup_cause", "context", "accountcode", NULL
+	static const char *keys[][2] = {
+		{"Unique-ID", "uuid"},
+		{"Caller-Caller-ID-Name", "caller_id_name"},
+		{"Caller-Caller-ID-Number", "caller_id_number"},
+		{"Caller-Destination-Number", "destination_number"},
+		{"Caller-Direction", "direction"},
+		{"Caller-Context", "context"},
+		{"Hangup-Cause", "hangup_cause"},
+		{"Caller-Channel-Created-Date", "start_stamp"},
+		{"Caller-Channel-Hangup-Date", "end_stamp"},
+		{NULL, NULL}
 	};
 	int i;
 
@@ -196,12 +206,9 @@ static void handle_cdr_event(switch_event_t *event)
 	cJSON_AddStringToObject(params, "uuid", switch_str_nil(uuid));
 
 	cdr = cJSON_CreateObject();
-	for (i = 0; keys[i]; i++) {
-		const char *val = switch_event_get_header(event, keys[i]);
-		cJSON_AddStringToObject(cdr, keys[i], switch_str_nil(val));
-	}
-	if (event->body && !zstr(event->body)) {
-		cJSON_AddStringToObject(cdr, "body", event->body);
+	for (i = 0; keys[i][0]; i++) {
+		const char *val = switch_event_get_header(event, keys[i][0]);
+		cJSON_AddStringToObject(cdr, keys[i][1], switch_str_nil(val));
 	}
 	cJSON_AddItemToObject(params, "cdr", cdr);
 
@@ -286,10 +293,10 @@ static void event_handler(switch_event_t *event)
 	case SWITCH_EVENT_CHANNEL_DESTROY:
 		if (event->event_id != SWITCH_EVENT_CHANNEL_DESTROY) {
 			handle_channel_event(event);
+			if (event->event_id == SWITCH_EVENT_CHANNEL_HANGUP_COMPLETE) {
+				handle_cdr_event(event);
+			}
 		}
-		break;
-	case SWITCH_EVENT_CDR:
-		handle_cdr_event(event);
 		break;
 	case SWITCH_EVENT_BACKGROUND_JOB:
 		handle_background_job(event);

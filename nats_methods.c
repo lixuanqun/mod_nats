@@ -317,14 +317,14 @@ static switch_status_t mn_getvar(cJSON *params, cJSON *extra)
 	if (data && cJSON_IsArray(data)) {
 		cJSON_ArrayForEach(item, data) {
 			if (cJSON_IsString(item) && !zstr(item->valuestring)) {
-				const char *val = switch_channel_get_variable_dup(channel, item->valuestring, SWITCH_FALSE);
+				const char *val = switch_channel_get_variable(channel, item->valuestring);
 				cJSON_AddStringToObject(out, item->valuestring, switch_str_nil(val));
 			}
 		}
 	} else if (data && cJSON_IsObject(data)) {
 		cJSON_ArrayForEach(item, data) {
 			if (item->string) {
-				const char *val = switch_channel_get_variable_dup(channel, item->string, SWITCH_FALSE);
+				const char *val = switch_channel_get_variable(channel, item->string);
 				cJSON_AddStringToObject(out, item->string, switch_str_nil(val));
 			}
 		}
@@ -335,7 +335,7 @@ static switch_status_t mn_getvar(cJSON *params, cJSON *extra)
 		};
 		int i;
 		for (i = 0; keys[i]; i++) {
-			const char *val = switch_channel_get_variable_dup(channel, keys[i], SWITCH_FALSE);
+			const char *val = switch_channel_get_variable(channel, keys[i]);
 			cJSON_AddStringToObject(out, keys[i], switch_str_nil(val));
 		}
 	}
@@ -356,7 +356,7 @@ static switch_status_t mn_getstate(cJSON *params, cJSON *extra)
 	channel = switch_core_session_get_channel(session);
 	if (extra) {
 		cJSON_AddStringToObject(extra, "state", switch_channel_state_name(switch_channel_get_state(channel)));
-		cJSON_AddStringToObject(extra, "answer_state", switch_channel_state_name(switch_channel_running_state(channel)));
+		cJSON_AddStringToObject(extra, "answer_state", switch_channel_state_name(switch_channel_get_running_state(channel)));
 	}
 	switch_core_session_rwunlock(session);
 	return SWITCH_STATUS_SUCCESS;
@@ -383,7 +383,7 @@ static switch_status_t mn_getchandata(cJSON *params, cJSON *extra)
 	channel = switch_core_session_get_channel(session);
 	out = cJSON_CreateObject();
 	for (i = 0; keys[i]; i++) {
-		const char *val = switch_channel_get_variable_dup(channel, keys[i], SWITCH_FALSE);
+		const char *val = switch_channel_get_variable(channel, keys[i]);
 		cJSON_AddStringToObject(out, keys[i], switch_str_nil(val));
 	}
 	switch_core_session_rwunlock(session);
@@ -424,7 +424,7 @@ static switch_status_t mn_nativeapi(cJSON *params, cJSON *extra)
 	arg = (jargs && cJSON_IsString(jargs) && !zstr(jargs->valuestring)) ? jargs->valuestring : NULL;
 
 	SWITCH_STANDARD_STREAM(stream);
-	switch_api_execute(cmd, arg, NULL, &stream, 0);
+	switch_api_execute(cmd, arg, NULL, &stream);
 	if (extra) {
 		cJSON_AddStringToObject(extra, "data", stream.data ? (char *) stream.data : "");
 	}
@@ -448,7 +448,7 @@ static switch_status_t mn_nativejsapi(cJSON *params, cJSON *extra)
 	}
 
 	SWITCH_STANDARD_STREAM(stream);
-	switch_api_execute(cmd, arg, NULL, &stream, 0);
+	switch_api_execute(cmd, arg, NULL, &stream);
 	if (extra) {
 		/* passthrough text MVP: parse as JSON when the API returned json, else raw */
 		cJSON *jres = stream.data ? cJSON_Parse((char *) stream.data) : NULL;
@@ -478,7 +478,7 @@ static switch_status_t mn_jstatus(cJSON *params, cJSON *extra)
 	data = cJSON_CreateObject();
 	cJSON_AddStringToObject(data, "systemStatus", switch_core_ready() ? "READY" : "NOT READY");
 	cJSON_AddNumberToObject(data, "uptime", (double) (switch_core_uptime() / 1000000));
-	cJSON_AddStringToObject(data, "version", switch_core_version());
+	cJSON_AddStringToObject(data, "version", switch_version_full());
 	cJSON_AddNumberToObject(data, "sessions", (double) switch_core_session_count());
 	cJSON_AddNumberToObject(data, "sessions_peak", (double) sessions_peak);
 	cJSON_AddNumberToObject(data, "sps", (double) sps);
@@ -541,11 +541,11 @@ static switch_status_t mn_dial(cJSON *params, cJSON *extra)
 			size_t l = strlen(vars);
 			if (l && vars[l - 1] == ',') vars[l - 1] = '\0';
 		}
-		snprintf(dial_cmd, sizeof(dial_cmd), "{%s}%s", vars, jdial->valuestring);
+		snprintf(dial_cmd, sizeof(dial_cmd), "originate {%s}%s &park", vars, jdial->valuestring);
 	}
 
 	SWITCH_STANDARD_STREAM(stream);
-	switch_api_execute("bgapi", dial_cmd, NULL, &stream, 0);
+	switch_api_execute("bgapi", dial_cmd, NULL, &stream);
 	if (stream.data) {
 		if ((p = strstr((char *) stream.data, "Job-UUID:")) != NULL) {
 			char *end;
