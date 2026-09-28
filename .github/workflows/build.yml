@@ -1,0 +1,67 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      freeswitch_ref:
+        description: 'FreeSWITCH ref to build against (branch/tag/sha)'
+        required: false
+        default: ''
+
+jobs:
+  build-linux:
+    name: "Build against FreeSWITCH (${{ inputs.freeswitch_ref || 'master' }})"
+    runs-on: ubuntu-latest
+    container: signalwire/freeswitch-public-ci-base:bookworm-amd64
+    env:
+      FREESWITCH_REF: ${{ inputs.freeswitch_ref || 'master' }}
+      PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
+    steps:
+      - name: Checkout mod_nats
+        uses: actions/checkout@v4
+
+      - name: Install libnats build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends cmake ca-certificates
+
+      - name: Build and install libnats (nats.c)
+        run: |
+          git clone --depth 1 https://github.com/nats-io/nats.c /tmp/nats.c
+          cmake -S /tmp/nats.c -B /tmp/nats.c/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DNATS_BUILD_WITH_TLS=ON \
+            -DNATS_BUILD_STREAMING=OFF \
+            -DNATS_BUILD_EXAMPLES=OFF
+          cmake --build /tmp/nats.c/build --parallel
+          cmake --install /tmp/nats.c/build
+          ldconfig
+          echo "libnats version: $(pkg-config --modversion nats)"
+
+      - name: Fetch FreeSWITCH source
+        run: |
+          git clone --depth 1 --branch "$FREESWITCH_REF" https://github.com/signalwire/freeswitch /tmp/freeswitch
+
+      - name: Integrate mod_nats into the tree
+        run: |
+          DEST=/tmp/freeswitch/src/mod/event_handlers/mod_nats
+          mkdir -p "$DEST"
+          cp mod_nats.c mod_nats.h nats_conn.c nats_proto.c nats_methods.c nats_events.c Makefile.am "$DEST"/
+          sed -i 's|^#event_handlers/mod_nats$|event_handlers/mod_nats|' /tmp/freeswitch/build/modules.conf.in
+          grep -n 'mod_nats' /tmp/freeswitch/build/modules.conf.in
+
+      - name: Bootstrap and configure FreeSWITCH
+        run: |
+          cd /tmp/freeswitch
+          ./bootstrap.sh
+          ./configure
+
+      - name: Build mod_nats
+        run: |
+          cd /tmp/freeswitch
+          make -j"$(nproc)" mod_nats
+          find src/mod/event_handlers/mod_nats -name '*.so*' -o -name '*.la' | xargs ls -la

@@ -1,5 +1,7 @@
 # mod_nats
 
+[![build](https://github.com/lixuanqun/mod_nats/actions/workflows/build.yml/badge.svg)](https://github.com/lixuanqun/mod_nats/actions/workflows/build.yml)
+
 **FreeSWITCH NATS message bus module** — XCC-compatible call control over NATS.
 
 FreeSWITCH 的 NATS 消息总线集成模块：为 FreeSWITCH 提供基于 NATS 的呼叫控制面（XCC 协议兼容）、事件流与 CDR 发布。目标是替代 ESL 成为外部系统集成的正门，实现**媒体与控制分层**——RTP/录音/ASR 等媒体处理留在 FS 节点内，业务控制器（Java/Go/任意语言）只通过消息队列收发控制指令，从业务视角驱动呼叫。
@@ -102,12 +104,7 @@ cp -r mod_nats /path/to/freeswitch/src/mod/event_handlers/
 # 3) build/modules.conf.in 取消注释
 sed -i 's/#event_handlers\/mod_nats/event_handlers\/mod_nats/' /path/to/freeswitch/build/modules.conf.in
 
-# 4) configure.ac 的 STIRSHAKEN 检测后面追加（若无）：
-#    PKG_CHECK_MODULES([NATS], [nats >= 2.0],[
-#        AM_CONDITIONAL([HAVE_NATS],[true])],[
-#        AC_MSG_RESULT([no]); AM_CONDITIONAL([HAVE_NATS],[false])])
-
-# 5) 编译
+# 4) 编译（Makefile.am 通过 pkg-config 自动发现 libnats，无需改 configure.ac）
 cd /path/to/freeswitch
 autoreconf -i
 ./configure
