@@ -142,6 +142,14 @@ void mod_nats_proto_handle_request(mod_nats_req_t *req)
 	/* no id => notification: execute but never reply */
 
 	extra = cJSON_CreateObject();
+	{
+		mod_nats_req_ctx_t ctx;
+		cJSON *jctrl = cJSON_GetObjectItem(params, "ctrl_uuid");
+		memset(&ctx, 0, sizeof(ctx));
+		switch_copy_string(ctx.rpc_id, rpc_id, sizeof(ctx.rpc_id));
+		if (jctrl && cJSON_IsString(jctrl) && !zstr(jctrl->valuestring)) {
+			switch_copy_string(ctx.ctrl_uuid, jctrl->valuestring, sizeof(ctx.ctrl_uuid));
+		}
 
 	if (cJSON_IsString(method) && !zstr(method->valuestring)) {
 		m = find_method(method->valuestring);
@@ -157,7 +165,7 @@ void mod_nats_proto_handle_request(mod_nats_req_t *req)
 					goto finish;
 				}
 			}
-			st = m->fn(params, extra);
+			st = m->fn(&ctx, params, extra);
 			switch (st) {
 			case SWITCH_STATUS_SUCCESS:
 				code = 200;
@@ -185,6 +193,7 @@ void mod_nats_proto_handle_request(mod_nats_req_t *req)
 		code = 400;
 		msg = "missing method";
 	}
+	} /* ctx scope */
 
   finish:
 	if (!zstr(rpc_id)) {

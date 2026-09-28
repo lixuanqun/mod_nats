@@ -7,8 +7,8 @@
  *    and, once a controller has run XNode.Accept, additionally to that
  *    controller's mailbox subject "<prefix>ctrl.<ctrl_uuid>".
  *  - Event.CDR goes to the dedicated CDR subject (JetStream stream material).
- *  - BACKGROUND_JOB results for tracked jobs (XNode.Dial) come back to the
- *    requesting controller as Event.Result.
+ *  - XNode.Dial outcomes are delivered to the controller mailbox directly
+ *    as Event.Result (correlated by the original rpc id).
  *
  * The event handler runs on an FS core thread: it only serializes and
  * enqueues (bounded, non-blocking) - never does socket I/O here.
@@ -47,7 +47,7 @@ static const char *CHAN_FIELD[][2] = {
 	{NULL, NULL}
 };
 
-void mod_nats_event_fill_channel_params(switch_event_t *event, cJSON *params)
+void mod_nats_event_fill_channel_params(switch_event_t *event, cJSON *params, const char *uuid)
 {
 	int i;
 
@@ -58,12 +58,19 @@ void mod_nats_event_fill_channel_params(switch_event_t *event, cJSON *params)
 		}
 	}
 
-	/* user-configured extra channel vars (whitelist) */
-	if (!zstr(mod_nats_globals.channel_params)) {
-		char *argv[64];
+	/* channel var whitelist: global config + per-channel (Accept) overlay */
+	{
+		const char *per_ch = mod_nats_methods_channel_params(uuid);
+		char merged[4096];
+		char *argv[96];
 		int argc, i;
-		char *list = strdup(mod_nats_globals.channel_params);
-		if (list) {
+		char *list;
+
+		snprintf(merged, sizeof(merged), "%s%s%s",
+				 switch_str_nil(mod_nats_globals.channel_params),
+				 (!zstr(mod_nats_globals.channel_params) && !zstr(per_ch)) ? "," : "",
+				 switch_str_nil(per_ch));
+		if (!zstr(merged) && (list = strdup(merged)) != NULL) {
 			argc = switch_separate_string(list, ',', argv, (int) (sizeof(argv) / sizeof(argv[0])));
 			for (i = 0; i < argc; i++) {
 				char header[256];
@@ -131,6 +138,23 @@ void mod_nats_events_send_result(const char *ctrl_uuid, const char *rpc_id, cJSO
 	cJSON_Delete(env);
 }
 
+/* one-shot: hang up an inbound channel nobody Accepted within the timeout */
+static void accept_timeout_task(switch_scheduler_task_t *task)
+{
+	char *uuid = (char *) task->cmd_arg;
+
+	if (!zstr(uuid) && zstr(mod_nats_methods_channel_ctrl(uuid))) {
+		switch_core_session_t *s = switch_core_session_locate(uuid);
+		if (s) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
+							  MOD_NATS_NAME " accept timeout, hanging up %s", uuid);
+			switch_channel_hangup(switch_core_session_get_channel(s), SWITCH_CAUSE_NO_ANSWER);
+			switch_core_session_rwunlock(s);
+		}
+	}
+	switch_safe_free(uuid);
+}
+
 static void handle_channel_event(switch_event_t *event)
 {
 	state_map_t *sm;
@@ -153,12 +177,19 @@ static void handle_channel_event(switch_event_t *event)
 	if (event->event_id == SWITCH_EVENT_CHANNEL_HANGUP_COMPLETE) {
 		/* channel is gone: release the controller binding */
 		mod_nats_methods_unregister_channel(uuid);
+	} else if (event->event_id == SWITCH_EVENT_CHANNEL_CREATE && mod_nats_globals.accept_timeout_sec > 0) {
+		const char *dir = switch_event_get_header(event, "Caller-Direction");
+		if (!zstr(dir) && !strcasecmp(dir, "inbound") && zstr(mod_nats_methods_channel_ctrl(uuid))) {
+			time_t when = switch_epoch_time_now(NULL) + mod_nats_globals.accept_timeout_sec;
+			switch_scheduler_add_task(when, accept_timeout_task, "mod_nats_accept_timeout",
+									   uuid, 0, strdup(uuid), SSHF_NONE);
+		}
 	}
 
 	params = cJSON_CreateObject();
 	cJSON_AddStringToObject(params, "node_uuid", mod_nats_globals.node_uuid);
 	cJSON_AddStringToObject(params, "state", sm->xcc_state);
-	mod_nats_event_fill_channel_params(event, params);
+	mod_nats_event_fill_channel_params(event, params, uuid);
 
 	{
 		char subject[MOD_NATS_PREFIX_MAX + 64];
@@ -220,38 +251,6 @@ static void handle_cdr_event(switch_event_t *event)
 	publish_notification(mod_nats_subject_cdr(), "Event.CDR", params);
 }
 
-static void handle_background_job(switch_event_t *event)
-{
-	const char *job_uuid = switch_event_get_header(event, "Job-UUID");
-	char rpc_id[128] = "";
-	const char *ctrl;
-	cJSON *result;
-	int code = 200;
-
-	if (zstr(job_uuid)) {
-		return;
-	}
-	if (!(ctrl = mod_nats_methods_job_ctrl(job_uuid, rpc_id, sizeof(rpc_id)))) {
-		return;
-	}
-
-	if (event->body && strstr(event->body, "-ERR")) {
-		code = 500;
-	}
-
-	result = cJSON_CreateObject();
-	cJSON_AddNumberToObject(result, "code", code);
-	cJSON_AddStringToObject(result, "message", code == 200 ? "OK" : "background job failed");
-	cJSON_AddStringToObject(result, "node_uuid", mod_nats_globals.node_uuid);
-	cJSON_AddStringToObject(result, "job_uuid", job_uuid);
-	if (event->body) {
-		cJSON_AddStringToObject(result, "data", event->body);
-	}
-
-	mod_nats_events_send_result(ctrl, rpc_id, result);
-	mod_nats_methods_untrack_job(job_uuid);
-}
-
 static void handle_native_event(switch_event_t *event)
 {
 	cJSON *params;
@@ -302,9 +301,6 @@ static void event_handler(switch_event_t *event)
 				handle_cdr_event(event);
 			}
 		}
-		break;
-	case SWITCH_EVENT_BACKGROUND_JOB:
-		handle_background_job(event);
 		break;
 	case SWITCH_EVENT_CUSTOM:
 	case SWITCH_EVENT_ALL:

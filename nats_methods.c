@@ -15,7 +15,7 @@
 /* ---------------------------------------------------------------------- */
 /* channel <-> controller bindings (XNode.Accept)                         */
 
-switch_status_t mod_nats_methods_register_channel(const char *uuid, const char *ctrl_uuid)
+switch_status_t mod_nats_methods_register_channel(const char *uuid, const char *ctrl_uuid, const char *params_csv)
 {
 	mod_nats_chan_t *chan;
 
@@ -31,10 +31,28 @@ switch_status_t mod_nats_methods_register_channel(const char *uuid, const char *
 	chan = (mod_nats_chan_t *) switch_core_alloc(mod_nats_globals.pool, sizeof(*chan));
 	switch_copy_string(chan->uuid, uuid, sizeof(chan->uuid));
 	switch_copy_string(chan->ctrl_uuid, ctrl_uuid, sizeof(chan->ctrl_uuid));
+	if (!zstr(params_csv)) {
+		chan->params_csv = switch_core_strdup(mod_nats_globals.pool, params_csv);
+	}
 	switch_core_hash_insert(mod_nats_globals.chan_hash, uuid, chan);
 	switch_mutex_unlock(mod_nats_globals.chan_mutex);
 
 	return SWITCH_STATUS_SUCCESS;
+}
+
+/* pool-owned csv of per-channel channel_params; valid until module unload */
+const char *mod_nats_methods_channel_params(const char *uuid)
+{
+	mod_nats_chan_t *chan;
+	const char *csv = NULL;
+
+	if (zstr(uuid)) return NULL;
+	switch_mutex_lock(mod_nats_globals.chan_mutex);
+	if ((chan = (mod_nats_chan_t *) switch_core_hash_find(mod_nats_globals.chan_hash, uuid))) {
+		csv = chan->params_csv;
+	}
+	switch_mutex_unlock(mod_nats_globals.chan_mutex);
+	return csv;
 }
 
 void mod_nats_methods_unregister_channel(const char *uuid)
@@ -54,53 +72,6 @@ const char *mod_nats_methods_channel_ctrl(const char *uuid)
 	switch_mutex_lock(mod_nats_globals.chan_mutex);
 	if ((chan = (mod_nats_chan_t *) switch_core_hash_find(mod_nats_globals.chan_hash, uuid))) {
 		ctrl = chan->ctrl_uuid;
-	}
-	switch_mutex_unlock(mod_nats_globals.chan_mutex);
-	return ctrl;
-}
-
-/* ---------------------------------------------------------------------- */
-/* bgapi job tracking: lets BACKGROUND_JOB events be routed back to the   */
-/* requesting controller as Event.Result                                  */
-
-switch_status_t mod_nats_methods_track_job(const char *job_uuid, const char *ctrl_uuid, const char *rpc_id)
-{
-	mod_nats_job_t *job;
-
-	if (zstr(job_uuid) || zstr(ctrl_uuid)) {
-		return SWITCH_STATUS_FALSE;
-	}
-	job = (mod_nats_job_t *) switch_core_alloc(mod_nats_globals.pool, sizeof(*job));
-	switch_copy_string(job->job_uuid, job_uuid, sizeof(job->job_uuid));
-	switch_copy_string(job->ctrl_uuid, ctrl_uuid, sizeof(job->ctrl_uuid));
-	switch_copy_string(job->rpc_id, switch_str_nil(rpc_id), sizeof(job->rpc_id));
-
-	switch_mutex_lock(mod_nats_globals.chan_mutex);	/* same lock domain: low churn hashes */
-	switch_core_hash_insert(mod_nats_globals.job_hash, job_uuid, job);
-	switch_mutex_unlock(mod_nats_globals.chan_mutex);
-	return SWITCH_STATUS_SUCCESS;
-}
-
-void mod_nats_methods_untrack_job(const char *job_uuid)
-{
-	if (zstr(job_uuid)) return;
-	switch_mutex_lock(mod_nats_globals.chan_mutex);
-	switch_core_hash_delete(mod_nats_globals.job_hash, job_uuid);
-	switch_mutex_unlock(mod_nats_globals.chan_mutex);
-}
-
-const char *mod_nats_methods_job_ctrl(const char *job_uuid, char *rpc_id, size_t rpc_id_len)
-{
-	mod_nats_job_t *job;
-	const char *ctrl = NULL;
-
-	if (zstr(job_uuid)) return NULL;
-	switch_mutex_lock(mod_nats_globals.chan_mutex);
-	if ((job = (mod_nats_job_t *) switch_core_hash_find(mod_nats_globals.job_hash, job_uuid))) {
-		ctrl = job->ctrl_uuid;
-		if (rpc_id && rpc_id_len) {
-			switch_copy_string(rpc_id, job->rpc_id, rpc_id_len);
-		}
 	}
 	switch_mutex_unlock(mod_nats_globals.chan_mutex);
 	return ctrl;
@@ -141,7 +112,7 @@ static switch_status_t exec_app(switch_core_session_t *session, const char *app,
 /* ---------------------------------------------------------------------- */
 /* XNode.* methods                                                        */
 
-static switch_status_t mn_accept(cJSON *params, cJSON *extra)
+static switch_status_t mn_accept(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *extra)
 {
 	switch_core_session_t *session;
 	switch_status_t st;
@@ -156,7 +127,22 @@ static switch_status_t mn_accept(cJSON *params, cJSON *extra)
 	}
 	switch_core_session_rwunlock(session);
 
-	st = mod_nats_methods_register_channel(uuid, jctrl->valuestring);
+	{
+		/* XCC: callers may subscribe extra channel variables at takeover time */
+		char csv[2048] = "";
+		size_t l;
+		cJSON *jp = cJSON_GetObjectItem(params, "channel_params");
+		if (jp && cJSON_IsArray(jp)) {
+			cJSON *it;
+			cJSON_ArrayForEach(it, jp) {
+				if (cJSON_IsString(it) && !zstr(it->valuestring)) {
+					l = strlen(csv);
+					snprintf(csv + l, sizeof(csv) - l, "%s%s", l ? "," : "", it->valuestring);
+				}
+			}
+		}
+		st = mod_nats_methods_register_channel(uuid, jctrl->valuestring, csv);
+	}
 	if (st != SWITCH_STATUS_SUCCESS) {
 		/* someone else took it first: XCC uses 419 for conflicts */
 		cJSON_AddNumberToObject(extra, "code", 419);
@@ -166,7 +152,7 @@ static switch_status_t mn_accept(cJSON *params, cJSON *extra)
 	return SWITCH_STATUS_SUCCESS;
 }
 
-static switch_status_t mn_answer(cJSON *params, cJSON *extra)
+static switch_status_t mn_answer(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *extra)
 {
 	switch_core_session_t *session;
 	switch_channel_t *channel;
@@ -180,7 +166,7 @@ static switch_status_t mn_answer(cJSON *params, cJSON *extra)
 	return SWITCH_STATUS_SUCCESS;
 }
 
-static switch_status_t mn_hangup(cJSON *params, cJSON *extra)
+static switch_status_t mn_hangup(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *extra)
 {
 	switch_core_session_t *session;
 	switch_channel_t *channel;
@@ -199,7 +185,7 @@ static switch_status_t mn_hangup(cJSON *params, cJSON *extra)
 	return SWITCH_STATUS_SUCCESS;
 }
 
-static switch_status_t mn_play(cJSON *params, cJSON *extra)
+static switch_status_t mn_play(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *extra)
 {
 	switch_core_session_t *session;
 	switch_status_t st;
@@ -221,7 +207,7 @@ static switch_status_t mn_play(cJSON *params, cJSON *extra)
 	return st;
 }
 
-static switch_status_t mn_stop(cJSON *params, cJSON *extra)
+static switch_status_t mn_stop(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *extra)
 {
 	switch_core_session_t *session;
 	switch_status_t st;
@@ -235,7 +221,7 @@ static switch_status_t mn_stop(cJSON *params, cJSON *extra)
 	return st;
 }
 
-static switch_status_t mn_broadcast(cJSON *params, cJSON *extra)
+static switch_status_t mn_broadcast(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *extra)
 {
 	switch_core_session_t *session;
 	switch_status_t st;
@@ -253,7 +239,7 @@ static switch_status_t mn_broadcast(cJSON *params, cJSON *extra)
 	return st;
 }
 
-static switch_status_t bridge_two(cJSON *params, cJSON *extra)
+static switch_status_t bridge_two(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *extra)
 {
 	switch_core_session_t *a = NULL, *b = NULL;
 	cJSON *jpeer = cJSON_GetObjectItem(params, "peer_uuid");
@@ -275,7 +261,7 @@ static switch_status_t bridge_two(cJSON *params, cJSON *extra)
 	return st;
 }
 
-static switch_status_t mn_setvar(cJSON *params, cJSON *extra)
+static switch_status_t mn_setvar(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *extra)
 {
 	switch_core_session_t *session;
 	switch_channel_t *channel;
@@ -298,7 +284,7 @@ static switch_status_t mn_setvar(cJSON *params, cJSON *extra)
 	return SWITCH_STATUS_SUCCESS;
 }
 
-static switch_status_t mn_getvar(cJSON *params, cJSON *extra)
+static switch_status_t mn_getvar(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *extra)
 {
 	switch_core_session_t *session;
 	switch_channel_t *channel;
@@ -345,7 +331,7 @@ static switch_status_t mn_getvar(cJSON *params, cJSON *extra)
 	return SWITCH_STATUS_SUCCESS;
 }
 
-static switch_status_t mn_getstate(cJSON *params, cJSON *extra)
+static switch_status_t mn_getstate(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *extra)
 {
 	switch_core_session_t *session;
 	switch_channel_t *channel;
@@ -362,7 +348,7 @@ static switch_status_t mn_getstate(cJSON *params, cJSON *extra)
 	return SWITCH_STATUS_SUCCESS;
 }
 
-static switch_status_t mn_getchandata(cJSON *params, cJSON *extra)
+static switch_status_t mn_getchandata(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *extra)
 {
 	switch_core_session_t *session;
 	switch_channel_t *channel;
@@ -392,7 +378,7 @@ static switch_status_t mn_getchandata(cJSON *params, cJSON *extra)
 	return SWITCH_STATUS_SUCCESS;
 }
 
-static switch_status_t mn_nativeapp(cJSON *params, cJSON *extra)
+static switch_status_t mn_nativeapp(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *extra)
 {
 	switch_core_session_t *session;
 	cJSON *jcmd = cJSON_GetObjectItem(params, "cmd");
@@ -410,7 +396,7 @@ static switch_status_t mn_nativeapp(cJSON *params, cJSON *extra)
 	return st;
 }
 
-static switch_status_t mn_nativeapi(cJSON *params, cJSON *extra)
+static switch_status_t mn_nativeapi(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *extra)
 {
 	cJSON *jcmd = cJSON_GetObjectItem(params, "cmd");
 	cJSON *jargs = cJSON_GetObjectItem(params, "args");
@@ -432,7 +418,7 @@ static switch_status_t mn_nativeapi(cJSON *params, cJSON *extra)
 	return SWITCH_STATUS_SUCCESS;
 }
 
-static switch_status_t mn_nativejsapi(cJSON *params, cJSON *extra)
+static switch_status_t mn_nativejsapi(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *extra)
 {
 	cJSON *jcmd = cJSON_GetObjectItem(params, "cmd");
 	cJSON *jparams = cJSON_GetObjectItem(params, "data");
@@ -463,7 +449,7 @@ static switch_status_t mn_nativejsapi(cJSON *params, cJSON *extra)
 	return SWITCH_STATUS_SUCCESS;
 }
 
-static switch_status_t mn_jstatus(cJSON *params, cJSON *extra)
+static switch_status_t mn_jstatus(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *extra)
 {
 	int sessions_peak = 0, sps = 0, sps_peak = 0;
 	cJSON *data;
@@ -488,20 +474,25 @@ static switch_status_t mn_jstatus(cJSON *params, cJSON *extra)
 	return SWITCH_STATUS_SUCCESS;
 }
 
-/* XNode.Dial: async originate via bgapi. Replies 202 + job_uuid; the
- * BACKGROUND_JOB result is routed to the ctrl mailbox as Event.Result. */
-static switch_status_t mn_dial(cJSON *params, cJSON *extra)
+/* XNode.Dial: direct originate via switch_ivr_originate - dial_string is
+ * passed as data, never concatenated into an api command line, so it cannot
+ * inject commands. Replies 202 immediately; the outcome reaches the ctrl
+ * mailbox as Event.Result carrying the original rpc id. The dialing
+ * controller owns the new b-leg from the start (implicit Accept). */
+static switch_status_t mn_dial(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *extra)
 {
-	cJSON *jctrl = cJSON_GetObjectItem(params, "ctrl_uuid");
 	cJSON *dest = cJSON_GetObjectItem(params, "destination");
-	cJSON *call_params, *first;
-	cJSON *gparams = dest ? cJSON_GetObjectItem(dest, "global_params") : NULL;
-	switch_stream_handle_t stream = { 0 };
-	char vars[2048] = "";
-	char dial_cmd[3072];
-	char *job_uuid = NULL, *p;
+	cJSON *call_params, *first, *gparams = NULL;
+	switch_event_t *ovars = NULL;
+	switch_core_session_t *bleg = NULL;
+	switch_call_cause_t cause = SWITCH_CAUSE_NONE;
+	const char *dial_string = NULL, *cid_name = NULL, *cid_number = NULL;
+	char job_uuid[SWITCH_UUID_FORMATTED_LENGTH + 1];
+	char uuid_b[SWITCH_UUID_FORMATTED_LENGTH + 1] = "";
+	int timeout = 60;
+	cJSON *res;
 
-	if (!jctrl || !cJSON_IsString(jctrl) || zstr(jctrl->valuestring) || !dest) {
+	if (zstr(ctx->ctrl_uuid) || !dest) {
 		return SWITCH_STATUS_FALSE;
 	}
 	call_params = cJSON_GetObjectItem(dest, "call_params");
@@ -511,62 +502,69 @@ static switch_status_t mn_dial(cJSON *params, cJSON *extra)
 	first = cJSON_GetArrayItem(call_params, 0);
 	{
 		cJSON *jdial = cJSON_GetObjectItem(first, "dial_string");
-		cJSON *juuid = cJSON_GetObjectItem(first, "uuid");
-		cJSON *jcidn = cJSON_GetObjectItem(first, "cid_number");
-		cJSON *jcidnm = cJSON_GetObjectItem(first, "cid_name");
-
+		cJSON *jcn = cJSON_GetObjectItem(first, "cid_number");
+		cJSON *jcm = cJSON_GetObjectItem(first, "cid_name");
 		if (!jdial || !cJSON_IsString(jdial) || zstr(jdial->valuestring)) {
 			return SWITCH_STATUS_FALSE;
 		}
+		dial_string = jdial->valuestring;
+		cid_name = (jcm && cJSON_IsString(jcm) && !zstr(jcm->valuestring)) ? jcm->valuestring : NULL;
+		cid_number = (jcn && cJSON_IsString(jcn) && !zstr(jcn->valuestring)) ? jcn->valuestring : NULL;
+		gparams = cJSON_GetObjectItem(dest, "global_params");
+	}
+	{
+		cJSON *jt = cJSON_GetObjectItem(params, "timeout");
+		if (jt && cJSON_IsNumber(jt) && jt->valueint >= 5 && jt->valueint <= 3600) {
+			timeout = jt->valueint;
+		}
+	}
 
-		if (juuid && cJSON_IsString(juuid) && !zstr(juuid->valuestring)) {
-			snprintf(vars + strlen(vars), sizeof(vars) - strlen(vars), "origination_uuid=%s,", juuid->valuestring);
-		}
-		if (jcidn && cJSON_IsString(jcidn) && !zstr(jcidn->valuestring)) {
-			snprintf(vars + strlen(vars), sizeof(vars) - strlen(vars), "origination_caller_id_number=%s,", jcidn->valuestring);
-		}
-		if (jcidnm && cJSON_IsString(jcidnm) && !zstr(jcidnm->valuestring)) {
-			snprintf(vars + strlen(vars), sizeof(vars) - strlen(vars), "origination_caller_id_name=%s,", jcidnm->valuestring);
+	switch_uuid_str(job_uuid, sizeof(job_uuid));
+	cJSON_AddNumberToObject(extra, "code", 202);
+	cJSON_AddStringToObject(extra, "message", "accepted");
+	cJSON_AddStringToObject(extra, "job_uuid", job_uuid);
+
+	switch_event_create(&ovars, SWITCH_EVENT_REQUEST_PARAMS);
+	{
+		cJSON *juuid2 = cJSON_GetObjectItem(first, "uuid");
+		if (juuid2 && cJSON_IsString(juuid2) && !zstr(juuid2->valuestring)) {
+			switch_event_add_header(ovars, SWITCH_STACK_BOTTOM, "origination_uuid", "%s", juuid2->valuestring);
 		}
 		if (gparams && cJSON_IsObject(gparams)) {
 			cJSON *item;
 			cJSON_ArrayForEach(item, gparams) {
 				if (item->string && cJSON_IsString(item)) {
-					snprintf(vars + strlen(vars), sizeof(vars) - strlen(vars), "%s=%s,", item->string, item->valuestring);
+					switch_event_add_header(ovars, SWITCH_STACK_BOTTOM, item->string, "%s", item->valuestring);
 				}
 			}
 		}
-		/* strip trailing comma */
-		{
-			size_t l = strlen(vars);
-			if (l && vars[l - 1] == ',') vars[l - 1] = '\0';
-		}
-		snprintf(dial_cmd, sizeof(dial_cmd), "originate {%s}%s &park", vars, jdial->valuestring);
 	}
 
-	SWITCH_STANDARD_STREAM(stream);
-	switch_api_execute("bgapi", dial_cmd, NULL, &stream);
-	if (stream.data) {
-		if ((p = strstr((char *) stream.data, "Job-UUID:")) != NULL) {
-			char *end;
-			p += strlen("Job-UUID:");
-			while (*p == ' ') p++;
-			if ((end = strchr(p, '\n')) != NULL) *end = '\0';
-			job_uuid = switch_core_strdup(mod_nats_globals.pool, p);
-		}
-		switch_safe_free(stream.data);
-	}
+	if (switch_ivr_originate(NULL, &bleg, &cause, dial_string, (uint32_t) timeout, NULL,
+							 cid_name, cid_number, NULL, ovars, SOF_NONE, NULL, NULL) == SWITCH_STATUS_SUCCESS && bleg) {
+		switch_copy_string(uuid_b, switch_core_session_get_uuid(bleg), sizeof(uuid_b));
+		/* the dialing controller owns the b-leg immediately */
+		mod_nats_methods_register_channel(uuid_b, ctx->ctrl_uuid, NULL);
+		switch_ivr_park_session(bleg);
+		switch_core_session_rwunlock(bleg);
 
-	if (job_uuid) {
-		cJSON *id_holder = NULL;
-		/* rpc id is attached by the protocol layer via the current request context;
-		 * for v0.1 we track with the ctrl mailbox only */
-		mod_nats_methods_track_job(job_uuid, jctrl->valuestring, "");
-		(void) id_holder;
-		cJSON_AddNumberToObject(extra, "code", 202);
-		cJSON_AddStringToObject(extra, "message", "accepted");
-		cJSON_AddStringToObject(extra, "job_uuid", job_uuid);
+		res = cJSON_CreateObject();
+		cJSON_AddNumberToObject(res, "code", 200);
+		cJSON_AddStringToObject(res, "message", "OK");
+		cJSON_AddStringToObject(res, "node_uuid", mod_nats_globals.node_uuid);
+		cJSON_AddStringToObject(res, "job_uuid", job_uuid);
+		cJSON_AddStringToObject(res, "uuid", uuid_b);
+	} else {
+		res = cJSON_CreateObject();
+		cJSON_AddNumberToObject(res, "code", 480);
+		cJSON_AddStringToObject(res, "message", switch_channel_cause2str(cause));
+		cJSON_AddStringToObject(res, "node_uuid", mod_nats_globals.node_uuid);
+		cJSON_AddStringToObject(res, "job_uuid", job_uuid);
 	}
+	switch_event_destroy(&ovars);
+
+	/* async outcome to the ctrl mailbox, correlated by the original rpc id */
+	mod_nats_events_send_result(ctx->ctrl_uuid, ctx->rpc_id, res);
 	return SWITCH_STATUS_SUCCESS;
 }
 

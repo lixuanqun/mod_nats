@@ -53,19 +53,19 @@ typedef struct mod_nats_req_s {
 	char *payload;
 } mod_nats_req_t;
 
+/* Per-request context handed to every XNode.* method: lets async methods
+ * (XNode.Dial) correlate the Event.Result with the original rpc id. */
+typedef struct mod_nats_req_ctx_s {
+	char rpc_id[128];				/* "" when the request is a notification */
+	char ctrl_uuid[SWITCH_UUID_FORMATTED_LENGTH + 1];
+} mod_nats_req_ctx_t;
+
 /* Per-channel controller binding, created by XNode.Accept */
 typedef struct mod_nats_chan_s {
 	char uuid[SWITCH_UUID_FORMATTED_LENGTH + 1];
 	char ctrl_uuid[SWITCH_UUID_FORMATTED_LENGTH + 1];
-	switch_hash_index_t *params;	/* reserved: per-channel channel_params */
+	char *params_csv;				/* per-channel channel_params whitelist */
 } mod_nats_chan_t;
-
-/* bgapi job -> ctrl correlation, used to route Event.Result */
-typedef struct mod_nats_job_s {
-	char job_uuid[SWITCH_UUID_FORMATTED_LENGTH + 1];
-	char ctrl_uuid[SWITCH_UUID_FORMATTED_LENGTH + 1];
-	char rpc_id[128];
-} mod_nats_job_t;
 
 struct mod_nats_globals_s {
 	switch_memory_pool_t *pool;
@@ -95,7 +95,7 @@ struct mod_nats_globals_s {
 	switch_mutex_t *mutex;
 	switch_mutex_t *chan_mutex;
 	switch_hash_t *chan_hash;		/* uuid -> mod_nats_chan_t */
-	switch_hash_t *job_hash;		/* job-uuid -> mod_nats_job_t */
+	int accept_timeout_sec;		/* unclaimed inbound hangup timer, 0=off */
 	switch_queue_t *pub_queue;
 	switch_queue_t *req_queue;
 	switch_thread_t *pub_thread;
@@ -116,7 +116,7 @@ extern mod_nats_globals_t mod_nats_globals;
 
 typedef struct mod_nats_method_s {
 	const char *name;				/* e.g. "XNode.Answer" */
-	switch_status_t (*fn)(cJSON *params, cJSON *result);
+	switch_status_t (*fn)(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *result);
 	switch_bool_t needs_channel;	/* params.uuid must resolve to a session */
 } mod_nats_method_t;
 extern const mod_nats_method_t mod_nats_methods[];
@@ -137,18 +137,16 @@ const char *mod_nats_subject_event(const char *event_name);
 const char *mod_nats_subject_cdr(void);
 
 /* nats_methods.c */
-switch_status_t mod_nats_methods_register_channel(const char *uuid, const char *ctrl_uuid);
+switch_status_t mod_nats_methods_register_channel(const char *uuid, const char *ctrl_uuid, const char *params_csv);
 void mod_nats_methods_unregister_channel(const char *uuid);
 const char *mod_nats_methods_channel_ctrl(const char *uuid);
-switch_status_t mod_nats_methods_track_job(const char *job_uuid, const char *ctrl_uuid, const char *rpc_id);
-void mod_nats_methods_untrack_job(const char *job_uuid);
-const char *mod_nats_methods_job_ctrl(const char *job_uuid, char *rpc_id, size_t rpc_id_len);
+const char *mod_nats_methods_channel_params(const char *uuid);
 
 /* nats_events.c */
 switch_status_t mod_nats_events_start(void);
 void mod_nats_events_stop(void);
 void mod_nats_events_send_result(const char *ctrl_uuid, const char *rpc_id, cJSON *result);
-void mod_nats_event_fill_channel_params(switch_event_t *event, cJSON *params);
+void mod_nats_event_fill_channel_params(switch_event_t *event, cJSON *params, const char *uuid);
 
 /* mod_nats.c */
 switch_status_t mod_nats_config_reload(void);

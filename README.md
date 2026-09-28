@@ -76,12 +76,12 @@ result.code 语义：200 成功 / 202 已受理（结果走 Event.Result）/ 400
 
 | 方法 | 说明 |
 |------|------|
-| XNode.Accept | 控制器接管通道（首个成功者获得控制权，后续返回 419） |
+| XNode.Accept | 接管通道（首个成功者获得控制权，后续 419；可携带 channel_params 数组按通道订阅额外变量） |
 | XNode.Answer / Hangup | 应答 / 挂机（cause 可配，默认 NORMAL_CLEARING） |
 | XNode.Play / Stop / Broadcast | 放音 / 停止放音 / 广播媒体 |
 | XNode.Bridge / ChannelBridge | 桥接两条通道 |
 | XNode.SetVar / GetVar / GetState / GetChannelData | 变量与状态读写 |
-| XNode.Dial | 外呼（bgapi originate，立即回 202 + job_uuid，结果走 Event.Result） |
+| XNode.Dial | 外呼（switch_ivr_originate 直调，无命令拼接注入面；立即回 202 + job_uuid，结果走 Event.Result 且携带原始 rpc id；主叫控制器即刻拥有 b-leg） |
 | XNode.JStatus | 节点状态：sessions/peak/sps/uptime/version |
 | XNode.NativeApp / NativeAPI / NativeJSAPI | 逃生舱：任意 dialplan app / fs API / JSON API |
 | Event.Channel / Event.CDR / Event.Result | 事件与异步结果 |
@@ -149,8 +149,8 @@ nats sub 'nats.fs.event.cdr'
 
 ## 7. 已知限制（v0.1）
 
-- XNode.Dial 的 Event.Result 目前不带原始 rpc id，用 `job_uuid` 关联；
 - 非法 JSON 请求按 JSON-RPC 2.0 规范回 `id:null` 错误；请求队列满时回 503（v0.1.2）；
+- v0.1.3：XNode.Dial 改为 switch_ivr_originate 直调（dial_string 不再拼接进 api 命令行，消除注入面），Event.Result 携带原始 rpc id，主叫控制器隐式接管 b-leg；Accept 支持 per-channel channel_params；新增 accept-timeout（inbound 通道超时无人接管自动挂机，默认 10s，0 关闭）；卸载路径移除 cnats 连接回调注册（消灭 reload 期 asyncCbs 线程崩溃源）并加入事件回调 drain；
 - Accept 无"10 秒无人接管挂机"逻辑（XCC 语义），来话需 dialplan 配合 park；
 - 未在所有平台编译验证，首次编译可能需修正个别 API 签名差异；
 - Windows 工程（.vcxproj）未创建（建议 vcpkg 安装 nats.c）。

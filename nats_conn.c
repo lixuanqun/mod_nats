@@ -123,22 +123,6 @@ static void on_node_message(natsConnection *nc, natsSubscription *sub, natsMsg *
 	natsMsg_Destroy(msg);
 }
 
-static void on_disconnected(natsConnection *nc, void *closure)
-{
-	switch_mutex_lock(mod_nats_globals.mutex);
-	mod_nats_globals.conn_state = MN_CONN_CONNECTING;
-	switch_mutex_unlock(mod_nats_globals.mutex);
-	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, MOD_NATS_NAME " disconnected from NATS, auto-reconnect in progress\n");
-}
-
-static void on_reconnected(natsConnection *nc, void *closure)
-{
-	switch_mutex_lock(mod_nats_globals.mutex);
-	mod_nats_globals.conn_state = MN_CONN_UP;
-	switch_mutex_unlock(mod_nats_globals.mutex);
-	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, MOD_NATS_NAME " reconnected to NATS\n");
-}
-
 switch_status_t mod_nats_publish_enqueue(const char *subject, const char *reply, const char *payload)
 {
 	mod_nats_pub_t *pub;
@@ -172,13 +156,16 @@ switch_status_t mod_nats_publish_enqueue(const char *subject, const char *reply,
 
 const char *mod_nats_conn_state_name(void)
 {
+	/* live query: no connection callbacks are registered, so there is no
+	 * state to maintain (and nothing for cnats async threads to run during
+	 * connection teardown on reload). */
 	switch_mutex_lock(mod_nats_globals.mutex);
-	{
-		const char *name = mod_nats_globals.conn_state == MN_CONN_UP ? "UP" :
-			mod_nats_globals.conn_state == MN_CONN_CONNECTING ? "CONNECTING" : "DOWN";
+	if (mod_nats_globals.nc && natsConnection_Status(mod_nats_globals.nc) == NATS_CONN_STATUS_CONNECTED) {
 		switch_mutex_unlock(mod_nats_globals.mutex);
-		return name;
+		return "UP";
 	}
+	switch_mutex_unlock(mod_nats_globals.mutex);
+	return "DOWN";
 }
 
 switch_status_t mod_nats_conn_start(void)
@@ -198,8 +185,6 @@ switch_status_t mod_nats_conn_start(void)
 	natsOptions_SetReconnectWait(opts, 2000);
 	natsOptions_SetMaxReconnect(opts, -1);	/* reconnect forever */
 	natsOptions_SetRetryOnFailedConnect(opts, 1, NULL, NULL);	/* connect async, conn usable immediately */
-	natsOptions_SetDisconnectedCB(opts, on_disconnected, NULL);
-	natsOptions_SetReconnectedCB(opts, on_reconnected, NULL);
 
 	if (!zstr(mod_nats_globals.credentials)) {
 		natsOptions_SetUserCredentialsFromFiles(opts, mod_nats_globals.credentials, NULL);

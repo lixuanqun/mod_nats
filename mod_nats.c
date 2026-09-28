@@ -85,6 +85,8 @@ static switch_status_t config_load(switch_bool_t reload)
 				mod_nats_globals.enable_events = switch_true(val);
 			} else if (!strcmp(name, "enable-cdr")) {
 				mod_nats_globals.enable_cdr = switch_true(val);
+			} else if (!strcmp(name, "accept-timeout")) {
+				mod_nats_globals.accept_timeout_sec = atoi(val);
 			} else if (!strcmp(name, "publish-native-events")) {
 				mod_nats_globals.publish_native_events = switch_true(val);
 			} else if (!strcmp(name, "workers")) {
@@ -179,6 +181,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_nats_load)
 	mod_nats_globals.started = switch_time_now();
 	mod_nats_globals.enable_events = SWITCH_TRUE;
 	mod_nats_globals.enable_cdr = SWITCH_TRUE;
+	mod_nats_globals.accept_timeout_sec = 10;
 	switch_copy_string(mod_nats_globals.urls, "nats://127.0.0.1:4222", sizeof(mod_nats_globals.urls));
 	switch_copy_string(mod_nats_globals.subject_prefix, MOD_NATS_DEFAULT_PREFIX, sizeof(mod_nats_globals.subject_prefix));
 
@@ -189,7 +192,6 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_nats_load)
 	switch_mutex_init(&mod_nats_globals.mutex, SWITCH_MUTEX_NESTED, pool);
 	switch_mutex_init(&mod_nats_globals.chan_mutex, SWITCH_MUTEX_NESTED, pool);
 	switch_core_hash_init(&mod_nats_globals.chan_hash);
-	switch_core_hash_init(&mod_nats_globals.job_hash);
 	switch_queue_create(&mod_nats_globals.pub_queue, mod_nats_globals.pub_qlen, pool);
 	switch_queue_create(&mod_nats_globals.req_queue, mod_nats_globals.req_qlen, pool);
 
@@ -230,6 +232,9 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_nats_shutdown)
 
 	mod_nats_globals.running = SWITCH_FALSE;
 	mod_nats_events_stop();
+	/* unbind only delists the binding; give in-flight event callbacks a
+	 * moment to return before we tear down the hashes/mutexes they touch */
+	switch_sleep(250000);
 	switch_queue_interrupt_all(mod_nats_globals.req_queue);
 	switch_queue_interrupt_all(mod_nats_globals.pub_queue);
 	/* apr_thread_join dereferences retval unconditionally - never pass NULL */
@@ -252,7 +257,6 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_nats_shutdown)
 	switch_safe_free(mod_nats_globals.channel_params);
 
 	switch_core_hash_destroy(&mod_nats_globals.chan_hash);
-	switch_core_hash_destroy(&mod_nats_globals.job_hash);
 
 	return SWITCH_STATUS_SUCCESS;
 }
