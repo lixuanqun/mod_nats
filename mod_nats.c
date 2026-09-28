@@ -87,6 +87,8 @@ static switch_status_t config_load(switch_bool_t reload)
 				mod_nats_globals.enable_cdr = switch_true(val);
 			} else if (!strcmp(name, "accept-timeout")) {
 				mod_nats_globals.accept_timeout_sec = atoi(val);
+			} else if (!strcmp(name, "metrics-interval")) {
+				mod_nats_globals.metrics_interval = atoi(val);
 			} else if (!strcmp(name, "publish-native-events")) {
 				mod_nats_globals.publish_native_events = switch_true(val);
 			} else if (!strcmp(name, "workers")) {
@@ -108,6 +110,7 @@ static switch_status_t config_load(switch_bool_t reload)
 	if (mod_nats_globals.workers > 16) mod_nats_globals.workers = 16;
 	if (mod_nats_globals.pub_qlen < 64) mod_nats_globals.pub_qlen = MOD_NATS_DEFAULT_PUB_QLEN;
 	if (mod_nats_globals.req_qlen < 16) mod_nats_globals.req_qlen = MOD_NATS_DEFAULT_REQ_QLEN;
+	if (mod_nats_globals.metrics_interval > 3600) mod_nats_globals.metrics_interval = 3600;
 
 	return SWITCH_STATUS_SUCCESS;
 }
@@ -136,6 +139,8 @@ static switch_status_t api_status(switch_stream_handle_t *stream)
 	stream->write_function(stream, "prefix        %s\n", mod_nats_globals.subject_prefix);
 	stream->write_function(stream, "node_uuid     %s\n", mod_nats_globals.node_uuid);
 	stream->write_function(stream, "listen        %s\n", mod_nats_subject_node());
+	stream->write_function(stream, "metrics       interval=%ds out=%lu\n",
+						   mod_nats_globals.metrics_interval, (unsigned long) mod_nats_globals.metrics_out);
 	stream->write_function(stream, "events        %s (native: %s) cdr: %s\n",
 						   mod_nats_globals.enable_events ? "on" : "off",
 						   mod_nats_globals.publish_native_events ? "on" : "off",
@@ -218,6 +223,8 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_nats_load)
 		return SWITCH_STATUS_FALSE;
 	}
 
+	mod_nats_metrics_start();
+
 	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
 					  MOD_NATS_NAME " loaded: proto=%s workers=%d listen=%s\n",
 					  MOD_NATS_PROTO_VERSION, mod_nats_globals.req_thread_count, mod_nats_subject_node());
@@ -234,6 +241,7 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_nats_shutdown)
 	mod_nats_events_stop();
 	/* unbind only delists the binding; give in-flight event callbacks a
 	 * moment to return before we tear down the hashes/mutexes they touch */
+	mod_nats_metrics_stop();
 	switch_sleep(250000);
 	switch_queue_interrupt_all(mod_nats_globals.req_queue);
 	switch_queue_interrupt_all(mod_nats_globals.pub_queue);

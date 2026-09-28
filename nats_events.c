@@ -312,6 +312,49 @@ static void event_handler(switch_event_t *event)
 	}
 }
 
+/* metrics heartbeat: publishes JStatus-equivalent node status on
+ * <prefix>metrics every metrics_interval seconds so registries/monitors
+ * can consume push-style instead of polling XNode.JStatus. */
+static void *SWITCH_THREAD_FUNC metrics_thread(switch_thread_t *t, void *data)
+{
+	int tick = 0;
+
+	while (mod_nats_globals.running) {
+		if (mod_nats_globals.metrics_interval > 0 && ++tick >= mod_nats_globals.metrics_interval) {
+			tick = 0;
+			publish_notification(mod_nats_subject_metrics(), "Event.Metrics", mod_nats_methods_node_status());
+			switch_mutex_lock(mod_nats_globals.mutex);
+			mod_nats_globals.metrics_out++;
+			switch_mutex_unlock(mod_nats_globals.mutex);
+		}
+		/* 1s granularity so shutdown joins never wait a full period */
+	switch_sleep(1000000);
+	}
+	return NULL;
+}
+
+switch_status_t mod_nats_metrics_start(void)
+{
+	switch_threadattr_t *thd_attr;
+
+	if (mod_nats_globals.metrics_interval <= 0) {
+		return SWITCH_STATUS_SUCCESS;
+	}
+	switch_threadattr_create(&thd_attr, mod_nats_globals.pool);
+	switch_threadattr_stacksize_set(thd_attr, SWITCH_THREAD_STACKSIZE);
+	/* joinable: the shutdown path joins this thread */
+	return switch_thread_create(&mod_nats_globals.metrics_thread, thd_attr, metrics_thread, NULL, mod_nats_globals.pool);
+}
+
+void mod_nats_metrics_stop(void)
+{
+	switch_status_t st;
+	if (mod_nats_globals.metrics_thread) {
+		switch_thread_join(&st, mod_nats_globals.metrics_thread);
+		mod_nats_globals.metrics_thread = NULL;
+	}
+}
+
 switch_status_t mod_nats_events_start(void)
 {
 	if (switch_event_bind(MOD_NATS_NAME, SWITCH_EVENT_ALL, SWITCH_EVENT_SUBCLASS_ANY, event_handler, NULL) != SWITCH_STATUS_SUCCESS) {

@@ -19,6 +19,7 @@ NODE_SUBJECT = f"{PREFIX}node.{NODE}"
 CTRL_SUBJECT = f"{PREFIX}ctrl.{CTRL}"
 
 results = []          # (name, ok, detail)
+metrics_msgs = []     # Event.Metrics heartbeats
 events = []           # every notification seen on nats.fs.>
 ctrl_msgs = []        # messages on the controller mailbox
 
@@ -104,11 +105,20 @@ async def main():
             events.append((msg.subject, data))
         if msg.subject == CTRL_SUBJECT:
             ctrl_msgs.append((msg.subject, data))
+        if msg.subject == f"{PREFIX}metrics":
+            metrics_msgs.append(data)
 
     await nc.subscribe(f"{PREFIX}event.>", cb=collector)
     await nc.subscribe(CTRL_SUBJECT, cb=collector)
+    await nc.subscribe(f"{PREFIX}metrics", cb=collector)
     cli = Client(nc)
     await asyncio.sleep(0.3)
+
+    print("== metrics heartbeat ==")
+    await asyncio.sleep(2.5)
+    ok = len(metrics_msgs) >= 1 and "sessions" in metrics_msgs[0].get("params", {})
+    check("Event.Metrics heartbeat received with fields", ok,
+          f"count={len(metrics_msgs)} sample={str(metrics_msgs[0])[:120] if metrics_msgs else None}")
 
     print("== basic node methods ==")
     out = await cli.req_code("XNode.JStatus", {}, 200, "XNode.JStatus -> 200")

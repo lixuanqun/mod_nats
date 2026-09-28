@@ -449,14 +449,12 @@ static switch_status_t mn_nativejsapi(mod_nats_req_ctx_t *ctx, cJSON *params, cJ
 	return SWITCH_STATUS_SUCCESS;
 }
 
-static switch_status_t mn_jstatus(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *extra)
+/* node status payload shared by XNode.JStatus and the metrics heartbeat */
+cJSON *mod_nats_methods_node_status(void)
 {
 	int sessions_peak = 0, sps = 0, sps_peak = 0;
 	cJSON *data;
 
-	if (!extra) {
-		return SWITCH_STATUS_FALSE;
-	}
 	switch_core_session_ctl(SCSC_SESSIONS_PEAK, &sessions_peak);
 	switch_core_session_ctl(SCSC_SPS, &sps);
 	switch_core_session_ctl(SCSC_SPS_PEAK, &sps_peak);
@@ -470,7 +468,15 @@ static switch_status_t mn_jstatus(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON 
 	cJSON_AddNumberToObject(data, "sps", (double) sps);
 	cJSON_AddNumberToObject(data, "sps_peak", (double) sps_peak);
 	cJSON_AddStringToObject(data, "node_uuid", mod_nats_globals.node_uuid);
-	cJSON_AddItemToObject(extra, "data", data);
+	return data;
+}
+
+static switch_status_t mn_jstatus(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *extra)
+{
+	if (!extra) {
+		return SWITCH_STATUS_FALSE;
+	}
+	cJSON_AddItemToObject(extra, "data", mod_nats_methods_node_status());
 	return SWITCH_STATUS_SUCCESS;
 }
 

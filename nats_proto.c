@@ -38,6 +38,13 @@ const char *mod_nats_subject_event(const char *event_name)
 	return buf;
 }
 
+const char *mod_nats_subject_metrics(void)
+{
+	static MOD_NATS_TLS char buf[MOD_NATS_PREFIX_MAX + 32];
+	snprintf(buf, sizeof(buf), "%smetrics", mod_nats_globals.subject_prefix);
+	return buf;
+}
+
 const char *mod_nats_subject_cdr(void)
 {
 	if (!zstr(mod_nats_globals.cdr_subject)) {

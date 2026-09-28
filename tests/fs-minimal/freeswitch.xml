@@ -43,6 +43,7 @@
         <param name="enable-cdr" value="true"/>
         <param name="publish-native-events" value="false"/>
         <param name="channel-params" value="hangup_cause,test_var"/>
+        <param name="metrics-interval" value="1"/>
       </settings>
     </configuration>
   </section>

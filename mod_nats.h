@@ -83,6 +83,7 @@ struct mod_nats_globals_s {
 	switch_bool_t enable_events;
 	switch_bool_t enable_cdr;
 	switch_bool_t publish_native_events;
+	int metrics_interval;			/* heartbeat period in sec, 0=off */
 	char *channel_params;			/* global channel var whitelist, comma separated */
 	int pub_qlen;
 	int req_qlen;
@@ -99,12 +100,14 @@ struct mod_nats_globals_s {
 	switch_queue_t *pub_queue;
 	switch_queue_t *req_queue;
 	switch_thread_t *pub_thread;
+	switch_thread_t *metrics_thread;
 	switch_thread_t *req_threads[16];
 	int req_thread_count;
 
 	/* stats (atomic-ish under mutex) */
 	uint64_t msgs_in;
 	uint64_t msgs_out;
+	uint64_t metrics_out;
 	uint64_t msgs_dropped;
 	uint64_t pub_errors;
 	uint64_t events_out;
@@ -135,8 +138,10 @@ const char *mod_nats_subject_node(void);
 const char *mod_nats_subject_ctrl(const char *ctrl_uuid);
 const char *mod_nats_subject_event(const char *event_name);
 const char *mod_nats_subject_cdr(void);
+const char *mod_nats_subject_metrics(void);
 
 /* nats_methods.c */
+cJSON *mod_nats_methods_node_status(void);
 switch_status_t mod_nats_methods_register_channel(const char *uuid, const char *ctrl_uuid, const char *params_csv);
 void mod_nats_methods_unregister_channel(const char *uuid);
 const char *mod_nats_methods_channel_ctrl(const char *uuid);
@@ -144,6 +149,8 @@ const char *mod_nats_methods_channel_params(const char *uuid);
 
 /* nats_events.c */
 switch_status_t mod_nats_events_start(void);
+switch_status_t mod_nats_metrics_start(void);
+void mod_nats_metrics_stop(void);
 void mod_nats_events_stop(void);
 void mod_nats_events_send_result(const char *ctrl_uuid, const char *rpc_id, cJSON *result);
 void mod_nats_event_fill_channel_params(switch_event_t *event, cJSON *params, const char *uuid);
