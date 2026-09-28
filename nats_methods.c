@@ -449,6 +449,108 @@ static switch_status_t mn_nativejsapi(mod_nats_req_ctx_t *ctx, cJSON *params, cJ
 	return SWITCH_STATUS_SUCCESS;
 }
 
+/* ---------------------------------------------------------------------- */
+/* system metrics (Linux /proc based; other platforms omit the fields)   */
+
+#ifdef __linux__
+#include <sys/sysinfo.h>
+
+typedef struct sys_cpu_sample_s {
+	unsigned long long total;
+	unsigned long long idle;
+	int valid;
+} sys_cpu_sample_t;
+
+static sys_cpu_sample_t last_cpu_sample = { 0, 0, 0 };
+
+static int read_cpu_sample(sys_cpu_sample_t *out)
+{
+	char buf[1024];
+	FILE *f = fopen("/proc/stat", "r");
+	unsigned long long v[10] = { 0 };
+	int i, n = 0;
+
+	if (!f) return 0;
+	if (!fgets(buf, sizeof(buf), f)) { fclose(f); return 0; }
+	fclose(f);
+	if (strncmp(buf, "cpu ", 4)) return 0;
+	{
+		char *p = buf + 4, *end;
+		for (i = 0; i < 10; i++) {
+			v[i] = strtoull(p, &end, 10);
+			if (end == p) break;
+			n++; p = end;
+		}
+	}
+	if (n < 5) return 0;
+	out->total = 0;
+	for (i = 0; i < n; i++) out->total += v[i];
+	out->idle = v[3] + ((n > 4) ? v[4] : 0);	/* idle + iowait */
+	out->valid = 1;
+	return 1;
+}
+
+static void add_system_metrics(cJSON *data)
+{
+	struct sysinfo si;
+	unsigned long long total_kb = 0, avail_kb = 0;
+	char key[64];
+	unsigned long long val;
+	FILE *f;
+	double la[3] = { 0, 0, 0 };
+	int cpus = (int) sysconf(_SC_NPROCESSORS_ONLN);
+
+	/* cpu utilization: delta between /proc/stat samples */
+	{
+		sys_cpu_sample_t now;
+		if (read_cpu_sample(&now)) {
+			if (last_cpu_sample.valid && now.total > last_cpu_sample.total) {
+				unsigned long long dt = now.total - last_cpu_sample.total;
+				unsigned long long di = now.idle - last_cpu_sample.idle;
+				if ((long long) di < 0) di = 0;
+				cJSON_AddNumberToObject(data, "cpu_percent",
+								   (double) (dt - di) * 100.0 / (double) dt);
+			}
+			last_cpu_sample = now;
+		}
+	}
+	cJSON_AddNumberToObject(data, "cpu_count", (double) (cpus > 0 ? cpus : 1));
+	if (getloadavg(la, 3) == 3) {
+		cJSON_AddNumberToObject(data, "load_1m", la[0]);
+		cJSON_AddNumberToObject(data, "load_5m", la[1]);
+		cJSON_AddNumberToObject(data, "load_15m", la[2]);
+	}
+
+	/* memory: /proc/meminfo */
+	if ((f = fopen("/proc/meminfo", "r")) != NULL) {
+		while (fscanf(f, "%63s %llu", key, &val) == 2) {
+			if (!strncmp(key, "MemTotal:", 9)) total_kb = val;
+			else if (!strncmp(key, "MemAvailable:", 13)) avail_kb = val;
+		}
+		fclose(f);
+	}
+	if (total_kb > 0) {
+		cJSON_AddNumberToObject(data, "mem_total_mb", (double) (total_kb / 1024));
+		cJSON_AddNumberToObject(data, "mem_available_mb", (double) (avail_kb / 1024));
+		if (total_kb >= avail_kb) {
+			cJSON_AddNumberToObject(data, "mem_used_percent",
+							   (double) (total_kb - avail_kb) * 100.0 / (double) total_kb);
+		}
+	}
+
+	/* this process RSS */
+	if ((f = fopen("/proc/self/statm", "r")) != NULL) {
+		unsigned long long rss_pages = 0;
+		if (fscanf(f, "%*s %llu", &rss_pages) == 1) {
+			cJSON_AddNumberToObject(data, "process_rss_mb",
+						   (double) (rss_pages * (unsigned long long) sysconf(_SC_PAGESIZE) / 1048576ULL));
+		}
+		fclose(f);
+	}
+	(void) si;
+}
+#endif /* __linux__ */
+
 /* node status payload shared by XNode.JStatus and the metrics heartbeat */
 cJSON *mod_nats_methods_node_status(void)
 {
@@ -467,6 +569,9 @@ cJSON *mod_nats_methods_node_status(void)
 	cJSON_AddNumberToObject(data, "sessions_peak", (double) sessions_peak);
 	cJSON_AddNumberToObject(data, "sps", (double) sps);
 	cJSON_AddNumberToObject(data, "sps_peak", (double) sps_peak);
+#ifdef __linux__
+	add_system_metrics(data);
+#endif
 	cJSON_AddStringToObject(data, "node_uuid", mod_nats_globals.node_uuid);
 	return data;
 }

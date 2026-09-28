@@ -117,6 +117,12 @@ async def main():
     print("== metrics heartbeat ==")
     await asyncio.sleep(2.5)
     ok = len(metrics_msgs) >= 1 and "sessions" in metrics_msgs[0].get("params", {})
+    m2 = metrics_msgs[1].get("params", {}) if len(metrics_msgs) > 1 else {}
+    check("Metrics carry system fields (cpu/mem)",
+          "cpu_count" in m2 and "mem_total_mb" in m2,
+          f"keys={sorted(m2.keys())[:14] if m2 else None}")
+    if ok and m2:
+        ok = True
     check("Event.Metrics heartbeat received with fields", ok,
           f"count={len(metrics_msgs)} sample={str(metrics_msgs[0])[:120] if metrics_msgs else None}")
 

@@ -14,8 +14,8 @@ podman exec modnats grep -c 'on_disconnected' /freeswitch/src/mod/event_handlers
 echo "--- rebuild ---"
 podman exec modnats bash -c 'touch /freeswitch/src/mod/event_handlers/mod_nats/*.c; cd /freeswitch && PKG_CONFIG_PATH=/usr/local/lib/pkgconfig make mod_nats > /tmp/rb.log 2>&1 || { tail -20 /tmp/rb.log; exit 1; }'
 echo "--- binary check: new string PRESENT (1) and old string ABSENT (0) ---"
-podman exec modnats bash -c 'strings /freeswitch/src/mod/event_handlers/mod_nats/.libs/mod_nats.so | grep -c "accept timeout"'
+podman exec modnats bash -c 'strings /freeswitch/src/mod/event_handlers/mod_nats/.libs/mod_nats.so | grep -c "process_rss_mb"'
 podman exec modnats bash -c 'strings /freeswitch/src/mod/event_handlers/mod_nats/.libs/mod_nats.so | grep -c "auto-reconnect in progress" || true'
 podman exec modnats cp /freeswitch/src/mod/event_handlers/mod_nats/.libs/mod_nats.so /tmp/fsmod/mod_nats.so
-podman exec modnats bash -c 'strings /tmp/fsmod/mod_nats.so | grep -c "accept timeout"'
+podman exec modnats bash -c 'strings /tmp/fsmod/mod_nats.so | grep -c "process_rss_mb"'
 echo SYNC_BUILD_OK
