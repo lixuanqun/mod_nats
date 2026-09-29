@@ -1,0 +1,34 @@
+services:
+  nats:
+    image: nats:latest
+    command: ["-c", "/etc/nats/nats-server.conf"]
+    volumes:
+      - ./nats-server.conf:/etc/nats/nats-server.conf:ro
+    networks: [lab]
+  fs:
+    build:
+      context: ../..
+      dockerfile: examples/docker-lab/Dockerfile.fs
+      args:
+        FS_IMAGE: ${FS_IMAGE:-aicc-fs:local-verify}
+    image: modnats-lab-fs
+    depends_on: [nats]
+    environment:
+      ESL_PASSWORD: ClueCon
+      ESL_LISTEN_IP: "127.0.0.1"
+      ESL_ACL: loopback.auto
+    networks: [lab]
+  consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile.tools
+    image: modnats-lab-tools
+    command: ["consume"]
+    depends_on: [nats]
+    volumes: [labdata:/data]
+    networks: [lab]
+volumes:
+  labdata:
+networks:
+  lab:
+    name: modnats-lab

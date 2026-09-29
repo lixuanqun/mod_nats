@@ -1,0 +1,21 @@
+<configuration name="nats.conf" description="NATS Bus">
+  <settings>
+    <param name="urls" value="nats://nats:4222"/>
+    <param name="subject-prefix" value="nats.fs."/>
+    <param name="node-uuid" value="fs-lab-1"/>
+    <param name="publish-events" value="true"/>
+    <param name="enable-cdr" value="true"/>
+    <param name="js-cdr" value="true"/>
+    <param name="js-metrics" value="true"/>
+    <param name="metrics-interval" value="5"/>
+    <param name="event-routing" value="both"/>
+    <param name="publish-native-events" value="false"/>
+    <param name="accept-timeout" value="0"/>
+    <param name="allow-native-api" value="false"/>
+    <param name="channel-params" value=""/>
+    <param name="cdr-subject" value=""/>
+    <param name="workers" value="8"/>
+    <param name="pub-qsize" value="16384"/>
+    <param name="req-qsize" value="8192"/>
+  </settings>
+</configuration>

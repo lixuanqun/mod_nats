@@ -95,7 +95,7 @@ NATS 消息总线集成模块——为 FreeSWITCH 提供基于 NATS 的呼叫控
 
 7. **接管呼叫。** 入向通道出现 `Event.Channel` / `START` 之后，用 `XNode.Accept`（或 `fs.channel.accept`）带上 `uuid` 和 `ctrl_uuid`。只有 Accept 成功的一方能执行控制方法。观察者不抢控制权，用 `fs.channel.observe`。外呼用 `XNode.Dial`，立即得到 202，最终结果在 `ctrl.<ctrl_uuid>` 上以 `Event.Result` 送达。
 
-本地 Docker 全链路和压测记录见 [TEST-REPORT.md](TEST-REPORT.md)。
+本地 Docker 全链路和压测记录见 [TEST-REPORT.md](TEST-REPORT.md)。脚本、消费端和启动方式在 [examples/docker-lab](examples/docker-lab)。
 
 ## 4. 上报事件与可消费事件
 
