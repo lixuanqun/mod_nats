@@ -1,13 +1,13 @@
 # mod_nats 模块设计文档
 
-NATS 消息总线集成模块——为 FreeSWITCH 提供基于 NATS 的呼叫控制面（XCC 协议兼容）、事件流与 CDR 发布。目标是替代 ESL 成为外部系统集成的正门，实现**媒体与控制分层**。
+NATS 消息总线集成模块。为 FreeSWITCH 提供通用的呼叫控制面、通道事件与 CDR 发布：任意外部系统通过 NATS 上的 JSON-RPC 接入，媒体留在 FreeSWITCH，控制走总线。控制协议与 XSwitch XCC 兼容，官方 XCtrl 可以作为客户端接入，自研的 Java、Go 或其他语言客户端按同一套主题和方法接入。
 
 ## 1. 架构
 
 ```
 ┌───────────────────────────────┐            ┌────────────────────────────┐
-│  FreeSWITCH (媒体节点)         │            │  外部控制器 (XCtrl)         │
-│                               │   NATS     │  Java / Go / ...           │
+│  FreeSWITCH (媒体节点)         │            │  外部控制器                 │
+│                               │   NATS     │  Java / Go / 自研服务       │
 │  RTP / 录音 / ASR/TTS(媒体面) │◄──────────►│  只收发控制消息,不碰媒体     │
 │  mod_nats   (控制面)          │  JSON-RPC  │                            │
 └───────────────────────────────┘            └────────────────────────────┘
@@ -40,7 +40,7 @@ NATS 消息总线集成模块——为 FreeSWITCH 提供基于 NATS 的呼叫控
 | `{prefix}event.{event_name}` | FS → 广播 | 原生事件转发（默认关闭） |
 | `{prefix}event.cdr` | FS → 广播 | CDR（建议服务端配 JetStream stream 持久化） |
 
-**SDK 兼容性**：官方 xctrl Go SDK（`xswitch-cn/xctrl`）将 `cn.xswitch.` 前缀硬编码在 `ctrl/ctrl.go` 中，无配置接口。两种用法：
+**与官方 XCtrl 对接（可选）**：模块的默认前缀是 `nats.fs.`，自研客户端直接用。官方 xctrl Go SDK（`xswitch-cn/xctrl`）把 `cn.xswitch.` 前缀写死在 `ctrl/ctrl.go` 里，没有配置项。要接这套 SDK 时：
 - 把本模块 `subject-prefix` 配成 `cn.xswitch.` → 官方 Go/Java SDK 即插即用；
 - 坚持自有前缀 `nats.fs.` → fork SDK 改前缀（Apache 2.0/MIT 允许），或自研客户端。
 
@@ -168,7 +168,7 @@ nats sub 'nats.fs.ctrl.>'       # 信箱：通道事件与 Event.Result
 
 ## 5. 协议
 
-XCC 风格 JSON-RPC 2.0（信封规范见 https://docs.xswitch.cn/xcc-api/design/ ，消息结构见 xswitch-cn/proto 的 xctrl.proto）：
+控制面使用 JSON-RPC 2.0。方法同时提供本模块的 `fs.*` 名称和 XCC 的 `XNode.*` 别名（`compat-xcc` 默认开启）。信封与 [XCC 设计](https://docs.xswitch.cn/xcc-api/design/) 以及 xswitch-cn/proto 的 `xctrl.proto` 一致，XCtrl 和自研客户端都按下面三种消息来写：
 
 ```json
 // 请求（控制器 → {prefix}node.{node_uuid}）
