@@ -18,7 +18,7 @@
 
 #define MOD_NATS_NAME "mod_nats"
 /* XCC wire protocol version implemented by this module */
-#define MOD_NATS_PROTO_VERSION "1.0.0"
+#define MOD_NATS_PROTO_VERSION "2.0.0"
 
 #define MOD_NATS_PREFIX_MAX 64
 #define MOD_NATS_URLS_MAX 1024
@@ -44,6 +44,7 @@ typedef struct mod_nats_pub_s {
 	char *subject;
 	char *reply;					/* optional inbox for request-reply */
 	char *payload;
+	char *request_id;				/* optional X-Request-Id NATS header echo */
 } mod_nats_pub_t;
 
 /* One inbound request popped from the subscription callback */
@@ -51,6 +52,7 @@ typedef struct mod_nats_req_s {
 	char *subject;
 	char *reply;
 	char *payload;
+	char *request_id;				/* X-Request-Id NATS header, may be NULL */
 } mod_nats_req_t;
 
 /* Per-request context handed to every XNode.* method: lets async methods
@@ -58,6 +60,7 @@ typedef struct mod_nats_req_s {
 typedef struct mod_nats_req_ctx_s {
 	char rpc_id[128];				/* "" when the request is a notification */
 	char ctrl_uuid[SWITCH_UUID_FORMATTED_LENGTH + 1];
+	char request_id[128];			/* X-Request-Id header value, "" when absent */
 } mod_nats_req_ctx_t;
 
 /* Per-channel controller binding, created by XNode.Accept */
@@ -97,6 +100,7 @@ struct mod_nats_globals_s {
 	switch_mutex_t *chan_mutex;
 	switch_hash_t *chan_hash;		/* uuid -> mod_nats_chan_t */
 	int accept_timeout_sec;		/* unclaimed inbound hangup timer, 0=off */
+	switch_bool_t compat_xcc;		/* route XNode.* aliases (default on) */
 	switch_queue_t *pub_queue;
 	switch_queue_t *req_queue;
 	switch_thread_t *pub_thread;
@@ -118,13 +122,15 @@ typedef struct mod_nats_globals_s mod_nats_globals_t;
 extern mod_nats_globals_t mod_nats_globals;
 
 typedef struct mod_nats_method_s {
-	const char *name;				/* e.g. "XNode.Answer" */
+	const char *name;				/* canonical name, e.g. "fs.channel.answer" */
+	const char *xcc_alias;			/* compat alias, routed when compat-xcc is on */
 	switch_status_t (*fn)(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *result);
 	switch_bool_t needs_channel;	/* params.uuid must resolve to a session */
 } mod_nats_method_t;
 extern const mod_nats_method_t mod_nats_methods[];
 
 /* nats_conn.c */
+switch_status_t mod_nats_publish_enqueue_hdr(const char *subject, const char *reply, const char *payload, const char *request_id);
 switch_status_t mod_nats_conn_start(void);
 void mod_nats_conn_stop(void);
 switch_status_t mod_nats_publish_enqueue(const char *subject, const char *reply, const char *payload);
@@ -133,6 +139,7 @@ const char *mod_nats_conn_state_name(void);
 /* nats_proto.c */
 void mod_nats_proto_handle_request(mod_nats_req_t *req);
 void mod_nats_proto_send_reply(const char *reply, const char *rpc_id, cJSON *result);
+void mod_nats_proto_send_reply_hdr(const char *reply, const char *rpc_id, const char *rpc_id_header, cJSON *result);
 void mod_nats_proto_send_error(const char *reply, const char *rpc_id, int code, const char *message);
 const char *mod_nats_subject_node(void);
 const char *mod_nats_subject_ctrl(const char *ctrl_uuid);
@@ -148,6 +155,8 @@ const char *mod_nats_methods_channel_ctrl(const char *uuid);
 const char *mod_nats_methods_channel_params(const char *uuid);
 
 /* nats_events.c */
+cJSON *mod_nats_events_capabilities(void);
+void mod_nats_events_publish_nodeup(void);
 switch_status_t mod_nats_events_start(void);
 switch_status_t mod_nats_metrics_start(void);
 void mod_nats_metrics_stop(void);

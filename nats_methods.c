@@ -662,6 +662,9 @@ static switch_status_t mn_dial(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *ex
 		switch_core_session_rwunlock(bleg);
 
 		res = cJSON_CreateObject();
+		if (!zstr(ctx->request_id)) {
+			cJSON_AddStringToObject(res, "request_id", ctx->request_id);
+		}
 		cJSON_AddNumberToObject(res, "code", 200);
 		cJSON_AddStringToObject(res, "message", "OK");
 		cJSON_AddStringToObject(res, "node_uuid", mod_nats_globals.node_uuid);
@@ -681,24 +684,56 @@ static switch_status_t mn_dial(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *ex
 	return SWITCH_STATUS_SUCCESS;
 }
 
-/* Method table: keep in sync with xctrl.proto service XNode */
+/* capability discovery payload: what this node speaks right now */
+cJSON *mod_nats_events_capabilities(void)
+{
+	cJSON *cap = cJSON_CreateObject();
+	const mod_nats_method_t *m;
+	cJSON *list = cJSON_CreateArray();
+
+	cJSON_AddStringToObject(cap, "node_uuid", mod_nats_globals.node_uuid);
+	cJSON_AddStringToObject(cap, "proto_version", MOD_NATS_PROTO_VERSION);
+	cJSON_AddStringToObject(cap, "subject_prefix", mod_nats_globals.subject_prefix);
+	cJSON_AddBoolToObject(cap, "compat_xcc", mod_nats_globals.compat_xcc == SWITCH_TRUE);
+	for (m = mod_nats_methods; m->name; m++) {
+		cJSON_AddItemToArray(list, cJSON_CreateString(m->name));
+		if (mod_nats_globals.compat_xcc == SWITCH_TRUE && m->xcc_alias) {
+			cJSON_AddItemToArray(list, cJSON_CreateString(m->xcc_alias));
+		}
+	}
+	cJSON_AddItemToObject(cap, "capabilities", list);
+	return cap;
+}
+
+/* fs.node.hello: request-reply form of Event.NodeUp */
+static switch_status_t mn_hello(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *extra)
+{
+	if (!extra) {
+		return SWITCH_STATUS_FALSE;
+	}
+	cJSON_AddItemToObject(extra, "data", mod_nats_events_capabilities());
+	return SWITCH_STATUS_SUCCESS;
+}
+
+/* Method table: canonical fs.* names with XCC aliases (xctrl SDK compat,
+ * gated by the compat-xcc config). Keep names in sync with README. */
 const mod_nats_method_t mod_nats_methods[] = {
-	{"XNode.Accept", mn_accept, SWITCH_TRUE},
-	{"XNode.Answer", mn_answer, SWITCH_TRUE},
-	{"XNode.Hangup", mn_hangup, SWITCH_TRUE},
-	{"XNode.Play", mn_play, SWITCH_TRUE},
-	{"XNode.Stop", mn_stop, SWITCH_TRUE},
-	{"XNode.Broadcast", mn_broadcast, SWITCH_TRUE},
-	{"XNode.Bridge", bridge_two, SWITCH_TRUE},
-	{"XNode.ChannelBridge", bridge_two, SWITCH_TRUE},
-	{"XNode.SetVar", mn_setvar, SWITCH_TRUE},
-	{"XNode.GetVar", mn_getvar, SWITCH_TRUE},
-	{"XNode.GetState", mn_getstate, SWITCH_TRUE},
-	{"XNode.GetChannelData", mn_getchandata, SWITCH_TRUE},
-	{"XNode.NativeApp", mn_nativeapp, SWITCH_TRUE},
-	{"XNode.NativeAPI", mn_nativeapi, SWITCH_FALSE},
-	{"XNode.NativeJSAPI", mn_nativejsapi, SWITCH_FALSE},
-	{"XNode.JStatus", mn_jstatus, SWITCH_FALSE},
-	{"XNode.Dial", mn_dial, SWITCH_FALSE},
-	{NULL, NULL, SWITCH_FALSE}
+	{"fs.node.hello", NULL, mn_hello, SWITCH_FALSE},
+	{"fs.channel.accept", "XNode.Accept", mn_accept, SWITCH_TRUE},
+	{"fs.channel.answer", "XNode.Answer", mn_answer, SWITCH_TRUE},
+	{"fs.channel.hangup", "XNode.Hangup", mn_hangup, SWITCH_TRUE},
+	{"fs.channel.play", "XNode.Play", mn_play, SWITCH_TRUE},
+	{"fs.channel.stop", "XNode.Stop", mn_stop, SWITCH_TRUE},
+	{"fs.channel.broadcast", "XNode.Broadcast", mn_broadcast, SWITCH_TRUE},
+	{"fs.channel.bridge", "XNode.Bridge", bridge_two, SWITCH_TRUE},
+	{"fs.channel.setvar", "XNode.SetVar", mn_setvar, SWITCH_TRUE},
+	{"fs.channel.getvar", "XNode.GetVar", mn_getvar, SWITCH_TRUE},
+	{"fs.channel.getstate", "XNode.GetState", mn_getstate, SWITCH_TRUE},
+	{"fs.channel.data", "XNode.GetChannelData", mn_getchandata, SWITCH_TRUE},
+	{"fs.native.app", "XNode.NativeApp", mn_nativeapp, SWITCH_TRUE},
+	{"fs.native.api", "XNode.NativeAPI", mn_nativeapi, SWITCH_FALSE},
+	{"fs.native.jsapi", "XNode.NativeJSAPI", mn_nativejsapi, SWITCH_FALSE},
+	{"fs.node.status", "XNode.JStatus", mn_jstatus, SWITCH_FALSE},
+	{"fs.channel.dial", "XNode.Dial", mn_dial, SWITCH_FALSE},
+	{NULL, NULL, NULL, SWITCH_FALSE}
 };

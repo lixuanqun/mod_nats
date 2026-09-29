@@ -29,6 +29,7 @@ static void *SWITCH_THREAD_FUNC request_worker(switch_thread_t *t, void *data)
 			switch_safe_free(r->subject);
 			switch_safe_free(r->reply);
 			switch_safe_free(r->payload);
+			switch_safe_free(r->request_id);
 			switch_safe_free(r);
 			continue;
 		}
@@ -38,6 +39,7 @@ static void *SWITCH_THREAD_FUNC request_worker(switch_thread_t *t, void *data)
 		switch_safe_free(req->subject);
 		switch_safe_free(req->reply);
 		switch_safe_free(req->payload);
+		switch_safe_free(req->request_id);
 		switch_safe_free(req);
 	}
 	return NULL;
@@ -89,6 +91,8 @@ static switch_status_t config_load(switch_bool_t reload)
 				mod_nats_globals.accept_timeout_sec = atoi(val);
 			} else if (!strcmp(name, "metrics-interval")) {
 				mod_nats_globals.metrics_interval = atoi(val);
+			} else if (!strcmp(name, "compat-xcc")) {
+				mod_nats_globals.compat_xcc = switch_true(val);
 			} else if (!strcmp(name, "publish-native-events")) {
 				mod_nats_globals.publish_native_events = switch_true(val);
 			} else if (!strcmp(name, "workers")) {
@@ -187,6 +191,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_nats_load)
 	mod_nats_globals.enable_events = SWITCH_TRUE;
 	mod_nats_globals.enable_cdr = SWITCH_TRUE;
 	mod_nats_globals.accept_timeout_sec = 10;
+	mod_nats_globals.compat_xcc = SWITCH_TRUE;
 	switch_copy_string(mod_nats_globals.urls, "nats://127.0.0.1:4222", sizeof(mod_nats_globals.urls));
 	switch_copy_string(mod_nats_globals.subject_prefix, MOD_NATS_DEFAULT_PREFIX, sizeof(mod_nats_globals.subject_prefix));
 
@@ -224,6 +229,8 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_nats_load)
 	}
 
 	mod_nats_metrics_start();
+
+	mod_nats_events_publish_nodeup();
 
 	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
 					  MOD_NATS_NAME " loaded: proto=%s workers=%d listen=%s\n",

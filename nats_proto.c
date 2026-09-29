@@ -62,7 +62,7 @@ static cJSON *build_result(int code, const char *message)
 	return result;
 }
 
-void mod_nats_proto_send_reply(const char *reply, const char *rpc_id, cJSON *result)
+void mod_nats_proto_send_reply_hdr(const char *reply, const char *rpc_id, const char *rpc_id_header, cJSON *result)
 {
 	cJSON *env;
 	char *payload;
@@ -86,15 +86,20 @@ void mod_nats_proto_send_reply(const char *reply, const char *rpc_id, cJSON *res
 
 	payload = cJSON_PrintUnformatted(env);
 	if (payload) {
-		mod_nats_publish_enqueue(reply, NULL, payload);
+		mod_nats_publish_enqueue_hdr(reply, NULL, payload, rpc_id_header);
 		free(payload);
 	}
 	cJSON_Delete(env);
 }
 
+void mod_nats_proto_send_reply(const char *reply, const char *rpc_id, cJSON *result)
+{
+	mod_nats_proto_send_reply_hdr(reply, rpc_id, NULL, result);
+}
+
 void mod_nats_proto_send_error(const char *reply, const char *rpc_id, int code, const char *message)
 {
-	mod_nats_proto_send_reply(reply, rpc_id, build_result(code, message));
+	mod_nats_proto_send_reply_hdr(reply, rpc_id, NULL, build_result(code, message));
 }
 
 static const mod_nats_method_t *find_method(const char *name)
@@ -108,6 +113,9 @@ static const mod_nats_method_t *find_method(const char *name)
 		if (!strcmp(m->name, name)) {
 			return m;
 		}
+		if (mod_nats_globals.compat_xcc == SWITCH_TRUE && m->xcc_alias && !strcmp(m->xcc_alias, name)) {
+			return m;
+		}
 	}
 	return NULL;
 }
@@ -118,6 +126,7 @@ void mod_nats_proto_handle_request(mod_nats_req_t *req)
 	cJSON *id = NULL, *method = NULL, *params = NULL, *params_owned = NULL, *extra = NULL;
 	const mod_nats_method_t *m;
 	char rpc_id[128] = "";
+	char req_hdr[128] = "";
 	switch_status_t st;
 	int code = 200;
 	const char *msg = "OK";
@@ -154,6 +163,10 @@ void mod_nats_proto_handle_request(mod_nats_req_t *req)
 		cJSON *jctrl = cJSON_GetObjectItem(params, "ctrl_uuid");
 		memset(&ctx, 0, sizeof(ctx));
 		switch_copy_string(ctx.rpc_id, rpc_id, sizeof(ctx.rpc_id));
+		if (!zstr(req->request_id)) {
+			switch_copy_string(ctx.request_id, req->request_id, sizeof(ctx.request_id));
+		}
+		switch_copy_string(req_hdr, ctx.request_id, sizeof(req_hdr));
 		if (jctrl && cJSON_IsString(jctrl) && !zstr(jctrl->valuestring)) {
 			switch_copy_string(ctx.ctrl_uuid, jctrl->valuestring, sizeof(ctx.ctrl_uuid));
 		}
@@ -218,7 +231,7 @@ void mod_nats_proto_handle_request(mod_nats_req_t *req)
 				cJSON_Delete(item);
 			}
 		}
-		mod_nats_proto_send_reply(req->reply, rpc_id, result);
+		mod_nats_proto_send_reply_hdr(req->reply, rpc_id, req_hdr[0] ? req_hdr : NULL, result);
 	}
 
 	if (extra) {

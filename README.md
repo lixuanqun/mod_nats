@@ -72,7 +72,21 @@ XCC 风格 JSON-RPC 2.0：
 
 result.code 语义：200 成功 / 202 已受理（结果走 Event.Result）/ 400 拒绝 / 404 通道不存在 / 419 已被其他控制器接管 / 500 内部错误 / 501 未实现。
 
-### 已实现方法（v0.1）
+### v0.2 协议：自有命名空间 + XCC 兼容层
+
+方法采用自有 canonical 命名（`fs.*`，snake_case 资源式），XCC 的 `XNode.*` 名称作为兼容别名（`compat-xcc` 配置，默认开启）——官方 xctrl SDK 与自有客户端可同时工作：
+
+| canonical（自有） | XCC 别名（兼容） |
+|---|---|
+| fs.node.hello / fs.node.status | —（hello 为自有扩展）/ XNode.JStatus |
+| fs.channel.accept / answer / hangup / play / stop / broadcast / bridge / dial | XNode.Accept / Answer / Hangup / Play / Stop / Broadcast / Bridge / Dial |
+| fs.channel.setvar / getvar / getstate / data | XNode.SetVar / GetVar / GetState / GetChannelData |
+| fs.native.app / api / jsapi | XNode.NativeApp / NativeAPI / NativeJSAPI |
+
+- **`fs.node.hello`（能力发现）**：请求-回复式返回节点能力清单（全部可路由方法名、proto 版本、前缀、compat 状态）；模块加载/reload 时同内容以 **`Event.NodeUp`** 广播到 `{prefix}event.nodeup`——注册中心可直接跟踪节点上下线
+- **`X-Request-Id` 头回显**：请求可携带 NATS 消息头 `X-Request-Id`，响应原样回显；XNode.Dial 的异步 Event.Result 也在 body 中携带 `request_id`——分布式追踪关联钩子
+
+### 已实现方法（v0.1 兼容清单）
 
 | 方法 | 说明 |
 |------|------|

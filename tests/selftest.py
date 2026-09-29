@@ -126,6 +126,31 @@ async def main():
     check("Event.Metrics heartbeat received with fields", ok,
           f"count={len(metrics_msgs)} sample={str(metrics_msgs[0])[:120] if metrics_msgs else None}")
 
+    print("== v0.2 protocol: hello / dual namespace / header echo ==")
+    out = await cli.req("fs.node.hello", {})
+    if out:
+        caps = out.get("result", {}).get("data", {})
+        cl = caps.get("capabilities", [])
+        check("fs.node.hello -> 200 with capabilities", out.get("result", {}).get("code") == 200 and "fs.channel.answer" in cl and "XNode.Answer" in cl,
+              f"count={len(cl)} compat={caps.get('compat_xcc')}")
+
+    out = await cli.req("fs.node.status", {})
+    check("canonical fs.node.status -> 200", out is not None and out.get("result", {}).get("code") == 200,
+          f"code={out.get('result', {}).get('code') if out else None}")
+    out = await cli.req("XNode.JStatus", {})
+    check("alias XNode.JStatus -> 200 (compat on)", out is not None and out.get("result", {}).get("code") == 200,
+          f"code={out.get('result', {}).get('code') if out else None}")
+
+    # X-Request-Id NATS header echoed on the reply
+    try:
+        rid = "selftest-rid-42"
+        reply = await nc.request(NODE_SUBJECT, json.dumps({"jsonrpc": "2.0", "id": "hdr1", "method": "fs.node.hello", "params": {}}).encode(),
+                                 timeout=5, headers={"X-Request-Id": rid})
+        got = (reply.headers or {}).get("X-Request-Id")
+        check("X-Request-Id header echoed", got == rid, f"got={got}")
+    except Exception as e:
+        check("X-Request-Id header echoed", False, f"ex={e}")
+
     print("== basic node methods ==")
     out = await cli.req_code("XNode.JStatus", {}, 200, "XNode.JStatus -> 200")
     if out:
@@ -150,7 +175,8 @@ async def main():
     out = await cli.req_code("XNode.Accept", {"uuid": ua, "ctrl_uuid": "other-ctrl"}, 419,
                              "XNode.Accept(A,2nd ctrl) -> 419")
 
-    await cli.req_code("XNode.GetState", {"uuid": ua}, 200, "XNode.GetState(A) -> 200")
+    out = await cli.req_code("fs.channel.getstate", {"uuid": ua}, 200, "fs.channel.getstate(A) -> 200 (canonical)")
+    await cli.req_code("XNode.GetState", {"uuid": ua}, 200, "XNode.GetState(A) -> 200 (alias)")
     await cli.req_code("XNode.SetVar", {"uuid": ua, "data": {"test_var": "hello-nats"}}, 200,
                        "XNode.SetVar(A,test_var) -> 200")
     out = await cli.req_code("XNode.GetVar", {"uuid": ua, "data": ["test_var"]}, 200, "XNode.GetVar(A) -> 200")

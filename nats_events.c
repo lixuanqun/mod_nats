@@ -355,6 +355,15 @@ void mod_nats_metrics_stop(void)
 	}
 }
 
+/* Event.NodeUp: announce this node and its capabilities; published at
+ * module load (and every reload) so registries can track node liveness
+ * together with the {prefix}metrics heartbeat. */
+void mod_nats_events_publish_nodeup(void)
+{
+	cJSON *params = mod_nats_events_capabilities();
+	publish_notification(mod_nats_subject_event("nodeup"), "Event.NodeUp", params);
+}
+
 switch_status_t mod_nats_events_start(void)
 {
 	if (switch_event_bind(MOD_NATS_NAME, SWITCH_EVENT_ALL, SWITCH_EVENT_SUBCLASS_ANY, event_handler, NULL) != SWITCH_STATUS_SUCCESS) {

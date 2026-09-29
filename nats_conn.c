@@ -38,7 +38,17 @@ static void *SWITCH_THREAD_FUNC publisher_thread(switch_thread_t *t, void *data)
 
 		if (mod_nats_globals.nc && (natsConnection_Status(mod_nats_globals.nc) == NATS_CONN_STATUS_CONNECTED)) {
 			natsStatus ns;
-			if (!zstr(pub->reply)) {
+			if (!zstr(pub->request_id)) {
+				natsMsg *hm = NULL;
+				if (natsMsg_Create(&hm, pub->subject, zstr(pub->reply) ? NULL : pub->reply,
+									  pub->payload, (int) strlen(pub->payload)) == NATS_OK) {
+					natsMsgHeader_Set(hm, "X-Request-Id", pub->request_id);
+					ns = natsConnection_PublishMsg(mod_nats_globals.nc, hm);
+					natsMsg_Destroy(hm);
+				} else {
+					ns = NATS_ERR;
+				}
+			} else if (!zstr(pub->reply)) {
 				ns = natsConnection_PublishRequest(mod_nats_globals.nc, pub->subject, pub->reply,
 												   (const void *) pub->payload, (int) strlen(pub->payload));
 			} else {
@@ -65,6 +75,7 @@ static void *SWITCH_THREAD_FUNC publisher_thread(switch_thread_t *t, void *data)
 		switch_safe_free(pub->subject);
 		switch_safe_free(pub->reply);
 		switch_safe_free(pub->payload);
+		switch_safe_free(pub->request_id);
 		switch_safe_free(pub);
 	}
 
@@ -100,9 +111,18 @@ static void on_node_message(natsConnection *nc, natsSubscription *sub, natsMsg *
 		switch_safe_free(req->subject);
 		switch_safe_free(req->reply);
 		switch_safe_free(req->payload);
+		switch_safe_free(req->request_id);
 		switch_safe_free(req);
 		natsMsg_Destroy(msg);
 		return;
+	}
+
+	/* capture the X-Request-Id NATS header for correlation */
+	{
+		const char *rid = NULL;
+		if (natsMsgHeader_Get(msg, "X-Request-Id", &rid) == NATS_OK && !zstr(rid)) {
+			req->request_id = strdup(rid);
+		}
 	}
 
 	if (switch_queue_trypush(mod_nats_globals.req_queue, req) != SWITCH_STATUS_SUCCESS) {
@@ -123,7 +143,7 @@ static void on_node_message(natsConnection *nc, natsSubscription *sub, natsMsg *
 	natsMsg_Destroy(msg);
 }
 
-switch_status_t mod_nats_publish_enqueue(const char *subject, const char *reply, const char *payload)
+switch_status_t mod_nats_publish_enqueue_hdr(const char *subject, const char *reply, const char *payload, const char *request_id)
 {
 	mod_nats_pub_t *pub;
 
@@ -139,11 +159,13 @@ switch_status_t mod_nats_publish_enqueue(const char *subject, const char *reply,
 	pub->subject = strdup(subject);
 	pub->reply = zstr(reply) ? NULL : strdup(reply);
 	pub->payload = strdup(payload);
+	pub->request_id = zstr(request_id) ? NULL : strdup(request_id);
 
 	if (!pub->subject || !pub->payload || switch_queue_trypush(mod_nats_globals.pub_queue, pub) != SWITCH_STATUS_SUCCESS) {
 		switch_safe_free(pub->subject);
 		switch_safe_free(pub->reply);
 		switch_safe_free(pub->payload);
+		switch_safe_free(pub->request_id);
 		switch_safe_free(pub);
 		switch_mutex_lock(mod_nats_globals.mutex);
 		mod_nats_globals.msgs_dropped++;
@@ -154,6 +176,10 @@ switch_status_t mod_nats_publish_enqueue(const char *subject, const char *reply,
 	return SWITCH_STATUS_SUCCESS;
 }
 
+switch_status_t mod_nats_publish_enqueue(const char *subject, const char *reply, const char *payload)
+{
+	return mod_nats_publish_enqueue_hdr(subject, reply, payload, NULL);
+}
 const char *mod_nats_conn_state_name(void)
 {
 	/* live query: no connection callbacks are registered, so there is no
