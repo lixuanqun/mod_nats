@@ -2,10 +2,13 @@
  * mod_nats event layer: FreeSWITCH events -> XCC Event.Channel / Event.CDR /
  * Event.Result on the bus.
  *
- * Routing:
- *  - Event.Channel goes to the broadcast subject "<prefix>event.channel.<STATE>"
- *    and, once a controller has run XNode.Accept, additionally to that
- *    controller's mailbox subject "<prefix>ctrl.<ctrl_uuid>".
+ * Routing (event-routing):
+ *  - broadcast: every channel event on "<prefix>event.channel.<STATE>" only.
+ *  - mailbox:   claimed channels go to the owner mailbox and to each
+ *               fs.channel.observe mailbox; unclaimed calls stay public.
+ *  - both:      public subject plus those mailboxes (module default).
+ *  DESTROY is published before the binding is dropped, so the owner still
+ *  receives the terminal event.
  *  - Event.CDR goes to the dedicated CDR subject (JetStream stream material).
  *  - XNode.Dial outcomes are delivered to the controller mailbox directly
  *    as Event.Result (correlated by the original rpc id).
@@ -60,12 +63,13 @@ void mod_nats_event_fill_channel_params(switch_event_t *event, cJSON *params, co
 
 	/* channel var whitelist: global config + per-channel (Accept) overlay */
 	{
-		const char *per_ch = mod_nats_methods_channel_params(uuid);
+		char per_ch[2048];
 		char merged[4096];
 		char *argv[96];
 		int argc, i;
 		char *list;
 
+		mod_nats_methods_channel_params_copy(uuid, per_ch, sizeof(per_ch));
 		snprintf(merged, sizeof(merged), "%s%s%s",
 				 switch_str_nil(mod_nats_globals.channel_params),
 				 (!zstr(mod_nats_globals.channel_params) && !zstr(per_ch)) ? "," : "",
@@ -138,12 +142,21 @@ void mod_nats_events_send_result(const char *ctrl_uuid, const char *rpc_id, cJSO
 	cJSON_Delete(env);
 }
 
+static void publish_channel_copy(const char *subject, cJSON *params)
+{
+	cJSON *dup = cJSON_Duplicate(params, 1);
+
+	if (dup) {
+		publish_notification(subject, "Event.Channel", dup);
+	}
+}
+
 /* one-shot: hang up an inbound channel nobody Accepted within the timeout */
 static void accept_timeout_task(switch_scheduler_task_t *task)
 {
 	char *uuid = (char *) task->cmd_arg;
 
-	if (!zstr(uuid) && zstr(mod_nats_methods_channel_ctrl(uuid))) {
+	if (!zstr(uuid) && !mod_nats_methods_channel_owned(uuid)) {
 		switch_core_session_t *s = switch_core_session_locate(uuid);
 		if (s) {
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
@@ -174,12 +187,9 @@ static void handle_channel_event(switch_event_t *event)
 		return;
 	}
 
-	if (event->event_id == SWITCH_EVENT_CHANNEL_HANGUP_COMPLETE) {
-		/* channel is gone: release the controller binding */
-		mod_nats_methods_unregister_channel(uuid);
-	} else if (event->event_id == SWITCH_EVENT_CHANNEL_CREATE && mod_nats_globals.accept_timeout_sec > 0) {
+	if (event->event_id == SWITCH_EVENT_CHANNEL_CREATE && mod_nats_globals.accept_timeout_sec > 0) {
 		const char *dir = switch_event_get_header(event, "Caller-Direction");
-		if (!zstr(dir) && !strcasecmp(dir, "inbound") && zstr(mod_nats_methods_channel_ctrl(uuid))) {
+		if (!zstr(dir) && !strcasecmp(dir, "inbound") && !mod_nats_methods_channel_owned(uuid)) {
 			time_t when = switch_epoch_time_now(NULL) + mod_nats_globals.accept_timeout_sec;
 			switch_scheduler_add_task(when, accept_timeout_task, "mod_nats_accept_timeout",
 									   uuid, 0, strdup(uuid), SSHF_NONE);
@@ -192,18 +202,32 @@ static void handle_channel_event(switch_event_t *event)
 	mod_nats_event_fill_channel_params(event, params, uuid);
 
 	{
-		char subject[MOD_NATS_PREFIX_MAX + 64];
-		snprintf(subject, sizeof(subject), "%sevent.channel.%s", mod_nats_globals.subject_prefix, sm->xcc_state);
-		publish_notification(subject, "Event.Channel", cJSON_Duplicate(params, 1));
+		char owner[SWITCH_UUID_FORMATTED_LENGTH + 1];
+		mod_nats_obs_t *aud = NULL;
+		mod_nats_obs_t *it;
+		int route = mod_nats_globals.event_routing;
+
+		mod_nats_methods_snapshot_audience(uuid, owner, sizeof(owner), &aud);
+		/* public subject: always, except mailbox mode once a channel is owned */
+		if (route != EVENT_ROUTE_MAILBOX || zstr(owner)) {
+			char subject[MOD_NATS_PREFIX_MAX + 64];
+			snprintf(subject, sizeof(subject), "%sevent.channel.%s", mod_nats_globals.subject_prefix, sm->xcc_state);
+			publish_channel_copy(subject, params);
+		}
+		if (route != EVENT_ROUTE_BROADCAST) {
+			if (!zstr(owner)) {
+				publish_channel_copy(mod_nats_subject_ctrl(owner), params);
+			}
+			for (it = aud; it; it = it->next) {
+				publish_channel_copy(mod_nats_subject_ctrl(it->ctrl_uuid), params);
+			}
+		}
+		mod_nats_obs_list_free(aud);
+		cJSON_Delete(params);
 	}
 
-	{
-		const char *ctrl = mod_nats_methods_channel_ctrl(uuid);
-		if (!zstr(ctrl)) {
-			publish_notification(mod_nats_subject_ctrl(ctrl), "Event.Channel", params);
-		} else {
-			cJSON_Delete(params);
-		}
+	if (event->event_id == SWITCH_EVENT_CHANNEL_HANGUP_COMPLETE) {
+		mod_nats_methods_unregister_channel(uuid);
 	}
 }
 

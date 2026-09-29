@@ -14,6 +14,13 @@
 
     <param name="publish-events" value="true"/>
     <param name="enable-cdr" value="true"/>
+    <!-- JetStream: create the streams on nats-server first. Requires libnats >= 3.0.
+         A failed ack falls back to core NATS (see nats status fallbacks). -->
+    <param name="js-cdr" value="false"/>
+    <param name="js-metrics" value="false"/>
+    <!-- broadcast = public subject only; mailbox = owner and observers after Accept;
+         both = public plus mailboxes (default, same delivery as v0.2) -->
+    <param name="event-routing" value="both"/>
     <!-- forward all native FS events (off by default; careful on high-CPS nodes) -->
     <param name="publish-native-events" value="false"/>
     <!-- extra channel variables to include in Event.Channel (comma separated) -->

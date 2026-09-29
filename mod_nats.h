@@ -63,11 +63,20 @@ typedef struct mod_nats_req_ctx_s {
 	char request_id[128];			/* X-Request-Id header value, "" when absent */
 } mod_nats_req_ctx_t;
 
-/* Per-channel controller binding, created by XNode.Accept */
+/* One observer mailbox subscription. Live nodes hang off a channel binding;
+ * snapshot copies use the same shape and are freed with mod_nats_obs_list_free. */
+typedef struct mod_nats_obs_s {
+	char ctrl_uuid[SWITCH_UUID_FORMATTED_LENGTH + 1];
+	struct mod_nats_obs_s *next;
+} mod_nats_obs_t;
+
+/* Per-channel binding. Owner is set by fs.channel.accept; observers watch
+ * events and never gain control. malloc'd, released by the hash destructor. */
 typedef struct mod_nats_chan_s {
 	char uuid[SWITCH_UUID_FORMATTED_LENGTH + 1];
-	char ctrl_uuid[SWITCH_UUID_FORMATTED_LENGTH + 1];
+	char ctrl_uuid[SWITCH_UUID_FORMATTED_LENGTH + 1]; /* "" until Accept */
 	char *params_csv;				/* per-channel channel_params whitelist */
+	mod_nats_obs_t *observers;
 } mod_nats_chan_t;
 
 struct mod_nats_globals_s {
@@ -100,13 +109,25 @@ struct mod_nats_globals_s {
 	switch_mutex_t *chan_mutex;
 	switch_hash_t *chan_hash;		/* uuid -> mod_nats_chan_t */
 	int accept_timeout_sec;		/* unclaimed inbound hangup timer, 0=off */
+	enum {
+		EVENT_ROUTE_BROADCAST = 0,	/* public {prefix}event.channel.* only */
+		EVENT_ROUTE_MAILBOX = 1,	/* owner + observer mailboxes; unclaimed stays public */
+		EVENT_ROUTE_BOTH = 2		/* public + mailboxes (load default) */
+	} event_routing;
 	switch_bool_t compat_xcc;		/* route XNode.* aliases (default on) */
+	switch_bool_t js_cdr;			/* CDR via JetStream (stream configured server-side) */
+	switch_bool_t js_metrics;		/* metrics heartbeat via JetStream */
 	switch_queue_t *pub_queue;
 	switch_queue_t *req_queue;
+	switch_queue_t *dial_queue;
 	switch_thread_t *pub_thread;
 	switch_thread_t *metrics_thread;
+	jsCtx *js;						/* JetStream context, NULL when unused */
 	switch_thread_t *req_threads[16];
 	int req_thread_count;
+	switch_thread_t *dial_threads[16];
+	int dial_thread_count;
+	switch_bool_t pub_stop;			/* publisher exits only after dial threads have finished */
 
 	/* stats (atomic-ish under mutex) */
 	uint64_t msgs_in;
@@ -114,6 +135,7 @@ struct mod_nats_globals_s {
 	uint64_t metrics_out;
 	uint64_t msgs_dropped;
 	uint64_t pub_errors;
+	uint64_t js_fallbacks;			/* JetStream ack failed, resent on core NATS */
 	uint64_t events_out;
 	switch_time_t started;
 };
@@ -133,6 +155,7 @@ extern const mod_nats_method_t mod_nats_methods[];
 switch_status_t mod_nats_publish_enqueue_hdr(const char *subject, const char *reply, const char *payload, const char *request_id);
 switch_status_t mod_nats_conn_start(void);
 void mod_nats_conn_stop(void);
+void mod_nats_js_ensure(void);
 switch_status_t mod_nats_publish_enqueue(const char *subject, const char *reply, const char *payload);
 const char *mod_nats_conn_state_name(void);
 
@@ -146,13 +169,18 @@ const char *mod_nats_subject_ctrl(const char *ctrl_uuid);
 const char *mod_nats_subject_event(const char *event_name);
 const char *mod_nats_subject_cdr(void);
 const char *mod_nats_subject_metrics(void);
+int mod_nats_subject_is_persistent(const char *subject);
 
 /* nats_methods.c */
 cJSON *mod_nats_methods_node_status(void);
 switch_status_t mod_nats_methods_register_channel(const char *uuid, const char *ctrl_uuid, const char *params_csv);
 void mod_nats_methods_unregister_channel(const char *uuid);
-const char *mod_nats_methods_channel_ctrl(const char *uuid);
-const char *mod_nats_methods_channel_params(const char *uuid);
+void mod_nats_methods_dial_start(void);
+void mod_nats_methods_dial_stop(void);
+switch_bool_t mod_nats_methods_channel_owned(const char *uuid);
+void mod_nats_methods_channel_params_copy(const char *uuid, char *buf, size_t buflen);
+void mod_nats_methods_snapshot_audience(const char *uuid, char *owner, size_t owner_len, mod_nats_obs_t **obs);
+void mod_nats_obs_list_free(mod_nats_obs_t *obs);
 
 /* nats_events.c */
 cJSON *mod_nats_events_capabilities(void);

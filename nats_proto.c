@@ -38,6 +38,23 @@ const char *mod_nats_subject_event(const char *event_name)
 	return buf;
 }
 
+/* CDR and the metrics heartbeat are the durable classes when js-cdr /
+ * js-metrics are on. Match the exact subject those publishers use, including
+ * a custom cdr-subject. Channel events stay core NATS on purpose. */
+int mod_nats_subject_is_persistent(const char *subject)
+{
+	if (zstr(subject)) {
+		return 0;
+	}
+	if (mod_nats_globals.js_cdr == SWITCH_TRUE && !strcmp(subject, mod_nats_subject_cdr())) {
+		return 1;
+	}
+	if (mod_nats_globals.js_metrics == SWITCH_TRUE && !strcmp(subject, mod_nats_subject_metrics())) {
+		return 1;
+	}
+	return 0;
+}
+
 const char *mod_nats_subject_metrics(void)
 {
 	static MOD_NATS_TLS char buf[MOD_NATS_PREFIX_MAX + 32];

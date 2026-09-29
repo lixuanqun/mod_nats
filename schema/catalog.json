@@ -1,0 +1,281 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://freeswitch.org/mod_nats/schema/catalog.json",
+  "title": "mod_nats wire catalog",
+  "description": "JSON-RPC 2.0 methods and events for mod_nats protocol 2.0.0. Canonical names are fs.*; XNode.* aliases are accepted when compat-xcc is on. Requests go to {prefix}node.{node_uuid}. Owner and observer events go to {prefix}ctrl.{ctrl_uuid}.",
+  "type": "object",
+  "$defs": {
+    "rpcId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 127
+    },
+    "uuid": {
+      "type": "string",
+      "minLength": 1
+    },
+    "channelRef": {
+      "type": "object",
+      "required": ["uuid", "ctrl_uuid"],
+      "properties": {
+        "uuid": { "$ref": "#/$defs/uuid" },
+        "ctrl_uuid": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Controller id. On an owned channel this must be the Accept owner; observers are rejected with result.code 419."
+        }
+      }
+    },
+    "request": {
+      "type": "object",
+      "required": ["jsonrpc", "method"],
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "id": { "$ref": "#/$defs/rpcId", "description": "Absent id means a notification: the method runs and no reply is sent." },
+        "method": { "type": "string" },
+        "params": { "type": "object" }
+      }
+    },
+    "result": {
+      "type": "object",
+      "required": ["code", "message", "node_uuid"],
+      "properties": {
+        "code": {
+          "type": "integer",
+          "description": "200 OK, 202 accepted, 400 refused, 404 no channel, 419 owned by someone else, 480 dial failed, 500 internal, 501 unknown method, 503 queue full."
+        },
+        "message": { "type": "string" },
+        "node_uuid": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "response": {
+      "type": "object",
+      "required": ["jsonrpc", "id", "result"],
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "id": { "oneOf": [{ "$ref": "#/$defs/rpcId" }, { "type": "null" }] },
+        "result": { "$ref": "#/$defs/result" }
+      }
+    },
+    "fs.channel.accept": {
+      "allOf": [{ "$ref": "#/$defs/channelRef" }],
+      "properties": {
+        "channel_params": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Extra channel variables copied onto later Event.Channel messages for this uuid."
+        }
+      }
+    },
+    "fs.channel.observe": {
+      "description": "Subscribe this ctrl_uuid to the channel mailbox. Does not take ownership. Idempotent. Cap is 32 observers per channel.",
+      "allOf": [{ "$ref": "#/$defs/channelRef" }]
+    },
+    "fs.channel.unobserve": {
+      "allOf": [{ "$ref": "#/$defs/channelRef" }]
+    },
+    "fs.channel.answer": { "allOf": [{ "$ref": "#/$defs/channelRef" }] },
+    "fs.channel.stop": { "allOf": [{ "$ref": "#/$defs/channelRef" }] },
+    "fs.channel.getstate": { "allOf": [{ "$ref": "#/$defs/channelRef" }] },
+    "fs.channel.data": { "allOf": [{ "$ref": "#/$defs/channelRef" }] },
+    "fs.channel.hangup": {
+      "allOf": [{ "$ref": "#/$defs/channelRef" }],
+      "properties": {
+        "cause": { "type": "string", "description": "FreeSWITCH hangup cause name. Default NORMAL_CLEARING." }
+      }
+    },
+    "fs.channel.play": {
+      "allOf": [{ "$ref": "#/$defs/channelRef" }],
+      "required": ["media"],
+      "properties": {
+        "media": {
+          "type": "object",
+          "required": ["file"],
+          "properties": { "file": { "type": "string", "minLength": 1 } }
+        }
+      }
+    },
+    "fs.channel.broadcast": {
+      "allOf": [{ "$ref": "#/$defs/channelRef" }],
+      "required": ["file"],
+      "properties": { "file": { "type": "string", "minLength": 1 } }
+    },
+    "fs.channel.bridge": {
+      "allOf": [{ "$ref": "#/$defs/channelRef" }],
+      "required": ["peer_uuid"],
+      "properties": {
+        "peer_uuid": {
+          "$ref": "#/$defs/uuid",
+          "description": "If the peer is owned, ctrl_uuid must own that leg too."
+        }
+      }
+    },
+    "fs.channel.setvar": {
+      "allOf": [{ "$ref": "#/$defs/channelRef" }],
+      "required": ["data"],
+      "properties": {
+        "data": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    },
+    "fs.channel.getvar": {
+      "allOf": [{ "$ref": "#/$defs/channelRef" }],
+      "properties": {
+        "data": {
+          "description": "Array of variable names, or an object whose keys are the names. Omitted returns a small built-in set.",
+          "oneOf": [
+            { "type": "array", "items": { "type": "string" } },
+            { "type": "object" }
+          ]
+        }
+      }
+    },
+    "fs.native.app": {
+      "allOf": [{ "$ref": "#/$defs/channelRef" }],
+      "required": ["cmd"],
+      "properties": {
+        "cmd": { "type": "string", "minLength": 1 },
+        "args": { "type": "string" }
+      }
+    },
+    "fs.native.api": {
+      "type": "object",
+      "required": ["cmd"],
+      "properties": {
+        "cmd": { "type": "string", "minLength": 1 },
+        "args": { "type": "string" }
+      }
+    },
+    "fs.native.jsapi": {
+      "type": "object",
+      "required": ["cmd"],
+      "properties": {
+        "cmd": { "type": "string", "minLength": 1 },
+        "data": {}
+      }
+    },
+    "fs.node.hello": {
+      "type": "object",
+      "description": "Returns proto_version, subject_prefix, compat_xcc and the capability name list."
+    },
+    "fs.node.status": {
+      "type": "object",
+      "description": "sessions, sessions_peak, sessions_max, sps, sps_peak, uptime, version. Linux builds also add cpu and memory fields."
+    },
+    "fs.channel.dial": {
+      "description": "Request thread enqueues and returns 202 plus job_uuid. Event.Result on the ctrl mailbox carries the same job_uuid and the original rpc id.",
+      "type": "object",
+      "required": ["ctrl_uuid", "destination"],
+      "properties": {
+        "ctrl_uuid": { "type": "string", "minLength": 1 },
+        "timeout": { "type": "integer", "minimum": 5, "maximum": 3600 },
+        "destination": {
+          "type": "object",
+          "required": ["call_params"],
+          "properties": {
+            "call_params": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "required": ["dial_string"],
+                "properties": {
+                  "dial_string": { "type": "string", "minLength": 1 },
+                  "cid_name": { "type": "string" },
+                  "cid_number": { "type": "string" },
+                  "uuid": { "type": "string", "description": "Becomes origination_uuid." }
+                }
+              }
+            },
+            "global_params": {
+              "type": "object",
+              "additionalProperties": { "type": "string" },
+              "description": "Copied onto the originate variable event as-is."
+            }
+          }
+        }
+      }
+    },
+    "Event.Channel": {
+      "type": "object",
+      "required": ["node_uuid", "state", "uuid"],
+      "properties": {
+        "node_uuid": { "type": "string" },
+        "state": {
+          "enum": ["START", "RINGING", "MEDIA", "ANSWERED", "BRIDGE", "UNBRIDGE", "DESTROY"]
+        },
+        "uuid": { "type": "string" },
+        "direction": { "type": "string" },
+        "caller_id_name": { "type": "string" },
+        "caller_id_number": { "type": "string" },
+        "destination_number": { "type": "string" },
+        "network_addr": { "type": "string" },
+        "context": { "type": "string" },
+        "peer_uuid": { "type": "string" },
+        "hangup_cause": { "type": "string" },
+        "timestamp": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "Event.CDR": {
+      "type": "object",
+      "required": ["node_uuid", "cdr"],
+      "properties": {
+        "node_uuid": { "type": "string" },
+        "uuid": { "type": "string" },
+        "cdr": {
+          "type": "object",
+          "properties": {
+            "uuid": { "type": "string" },
+            "caller_id_name": { "type": "string" },
+            "caller_id_number": { "type": "string" },
+            "destination_number": { "type": "string" },
+            "direction": { "type": "string" },
+            "context": { "type": "string" },
+            "hangup_cause": { "type": "string" },
+            "duration": { "type": "string" },
+            "billsec": { "type": "string" },
+            "start_stamp": { "type": "string" },
+            "answer_stamp": { "type": "string" },
+            "end_stamp": { "type": "string" }
+          }
+        }
+      }
+    },
+    "Event.Metrics": {
+      "description": "Same object as fs.node.status, wrapped as a notification on {prefix}metrics.",
+      "type": "object"
+    },
+    "Event.NodeUp": {
+      "description": "Same object as the fs.node.hello result data field. Published on {prefix}event.nodeup at load.",
+      "type": "object"
+    },
+    "Event.Result": {
+      "type": "object",
+      "required": ["code", "message", "node_uuid", "job_uuid"],
+      "properties": {
+        "code": { "type": "integer" },
+        "message": { "type": "string" },
+        "node_uuid": { "type": "string" },
+        "job_uuid": { "type": "string" },
+        "uuid": { "type": "string" },
+        "request_id": { "type": "string", "description": "Echo of the X-Request-Id header, when the dial carried one." }
+      }
+    },
+    "notification": {
+      "type": "object",
+      "required": ["jsonrpc", "method", "params"],
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "method": {
+          "enum": ["Event.Channel", "Event.CDR", "Event.Metrics", "Event.NodeUp", "Event.Result", "Event.NativeEvent"]
+        },
+        "params": { "type": "object" },
+        "id": { "$ref": "#/$defs/rpcId", "description": "Present on Event.Result when the dial request had an id." }
+      }
+    }
+  }
+}

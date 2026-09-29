@@ -11,72 +11,124 @@
  */
 #include "mod_nats.h"
 
+static void publish_one(mod_nats_pub_t *pub)
+{
+	if (!pub) {
+		return;
+	}
+
+	if (mod_nats_globals.nc && (natsConnection_Status(mod_nats_globals.nc) == NATS_CONN_STATUS_CONNECTED)) {
+		natsStatus ns = NATS_ERR;
+		jsCtx *js = NULL;
+		int via_js;
+
+		/* snapshot under the mutex; js_Publish blocks on the ack and must not hold it */
+		switch_mutex_lock(mod_nats_globals.mutex);
+		js = mod_nats_globals.js;
+		switch_mutex_unlock(mod_nats_globals.mutex);
+		if (!js && mod_nats_subject_is_persistent(pub->subject)) {
+			mod_nats_js_ensure();
+			switch_mutex_lock(mod_nats_globals.mutex);
+			js = mod_nats_globals.js;
+			switch_mutex_unlock(mod_nats_globals.mutex);
+		}
+		via_js = (js != NULL) && mod_nats_subject_is_persistent(pub->subject);
+
+		if (via_js) {
+			jsPubAck *pa = NULL;
+			jsPubOptions po;
+
+			/* synchronous ack: a missing stream fails here, so the core-NATS
+			 * fallback is real. A timeout is not a failure we can retry —
+			 * the server may already have stored the message. */
+			jsPubOptions_Init(&po);
+			po.MaxWait = 1000;
+			ns = js_Publish(&pa, js, pub->subject, (const void *) pub->payload,
+							(int) strlen(pub->payload), &po, NULL);
+			if (pa) {
+				jsPubAck_Destroy(pa);
+			}
+			if (ns == NATS_TIMEOUT) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+								  MOD_NATS_NAME " JetStream ack timeout for '%s'; not republishing\n",
+								  pub->subject);
+			} else if (ns != NATS_OK) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+								  MOD_NATS_NAME " JetStream publish to '%s' failed: %s; core NATS fallback\n",
+								  pub->subject, natsStatus_GetText(ns));
+				switch_mutex_lock(mod_nats_globals.mutex);
+				mod_nats_globals.js_fallbacks++;
+				switch_mutex_unlock(mod_nats_globals.mutex);
+				ns = natsConnection_Publish(mod_nats_globals.nc, pub->subject,
+										   (const void *) pub->payload, (int) strlen(pub->payload));
+			}
+		} else if (!zstr(pub->request_id)) {
+			natsMsg *hm = NULL;
+			if (natsMsg_Create(&hm, pub->subject, zstr(pub->reply) ? NULL : pub->reply,
+								  pub->payload, (int) strlen(pub->payload)) == NATS_OK) {
+				natsMsgHeader_Set(hm, "X-Request-Id", pub->request_id);
+				ns = natsConnection_PublishMsg(mod_nats_globals.nc, hm);
+				natsMsg_Destroy(hm);
+			} else {
+				ns = NATS_ERR;
+			}
+		} else if (!zstr(pub->reply)) {
+			ns = natsConnection_PublishRequest(mod_nats_globals.nc, pub->subject, pub->reply,
+											   (const void *) pub->payload, (int) strlen(pub->payload));
+		} else {
+			ns = natsConnection_Publish(mod_nats_globals.nc, pub->subject,
+										(const void *) pub->payload, (int) strlen(pub->payload));
+		}
+		if (ns == NATS_OK) {
+			switch_mutex_lock(mod_nats_globals.mutex);
+			mod_nats_globals.msgs_out++;
+			switch_mutex_unlock(mod_nats_globals.mutex);
+		} else {
+			if (ns != NATS_TIMEOUT) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+								  MOD_NATS_NAME " publish to '%s' failed: %s\n", pub->subject, natsStatus_GetText(ns));
+			}
+			switch_mutex_lock(mod_nats_globals.mutex);
+			mod_nats_globals.pub_errors++;
+			switch_mutex_unlock(mod_nats_globals.mutex);
+		}
+	} else {
+		switch_mutex_lock(mod_nats_globals.mutex);
+		mod_nats_globals.msgs_dropped++;
+		switch_mutex_unlock(mod_nats_globals.mutex);
+	}
+
+	switch_safe_free(pub->subject);
+	switch_safe_free(pub->reply);
+	switch_safe_free(pub->payload);
+	switch_safe_free(pub->request_id);
+	switch_safe_free(pub);
+}
+
 static void *SWITCH_THREAD_FUNC publisher_thread(switch_thread_t *t, void *data)
 {
-	mod_nats_pub_t *pub;
-
-	while (mod_nats_globals.running) {
+	/* pub_stop is raised only after dial threads have enqueued their last results */
+	while (!mod_nats_globals.pub_stop) {
 		void *pop = NULL;
 		switch_status_t st = switch_queue_pop(mod_nats_globals.pub_queue, &pop);
 
-		if (!mod_nats_globals.running) {
+		if (mod_nats_globals.pub_stop) {
 			if (pop) {
-				pub = (mod_nats_pub_t *) pop;
-				switch_safe_free(pub->subject);
-				switch_safe_free(pub->reply);
-				switch_safe_free(pub->payload);
-				switch_safe_free(pub);
+				publish_one((mod_nats_pub_t *) pop);
 			}
-			continue;
+			break;
 		}
-
 		if (st != SWITCH_STATUS_SUCCESS || !pop) {
 			continue;
 		}
+		publish_one((mod_nats_pub_t *) pop);
+	}
 
-		pub = (mod_nats_pub_t *) pop;
-
-		if (mod_nats_globals.nc && (natsConnection_Status(mod_nats_globals.nc) == NATS_CONN_STATUS_CONNECTED)) {
-			natsStatus ns;
-			if (!zstr(pub->request_id)) {
-				natsMsg *hm = NULL;
-				if (natsMsg_Create(&hm, pub->subject, zstr(pub->reply) ? NULL : pub->reply,
-									  pub->payload, (int) strlen(pub->payload)) == NATS_OK) {
-					natsMsgHeader_Set(hm, "X-Request-Id", pub->request_id);
-					ns = natsConnection_PublishMsg(mod_nats_globals.nc, hm);
-					natsMsg_Destroy(hm);
-				} else {
-					ns = NATS_ERR;
-				}
-			} else if (!zstr(pub->reply)) {
-				ns = natsConnection_PublishRequest(mod_nats_globals.nc, pub->subject, pub->reply,
-												   (const void *) pub->payload, (int) strlen(pub->payload));
-			} else {
-				ns = natsConnection_Publish(mod_nats_globals.nc, pub->subject,
-											(const void *) pub->payload, (int) strlen(pub->payload));
-			}
-			if (ns == NATS_OK) {
-				switch_mutex_lock(mod_nats_globals.mutex);
-				mod_nats_globals.msgs_out++;
-				switch_mutex_unlock(mod_nats_globals.mutex);
-			} else {
-				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
-								  MOD_NATS_NAME " publish to '%s' failed: %s\n", pub->subject, natsStatus_GetText(ns));
-				switch_mutex_lock(mod_nats_globals.mutex);
-				mod_nats_globals.pub_errors++;
-				switch_mutex_unlock(mod_nats_globals.mutex);
-			}
-		} else {
-			switch_mutex_lock(mod_nats_globals.mutex);
-			mod_nats_globals.msgs_dropped++;
-			switch_mutex_unlock(mod_nats_globals.mutex);
+	{
+		void *pop = NULL;
+		while (switch_queue_trypop(mod_nats_globals.pub_queue, &pop) == SWITCH_STATUS_SUCCESS && pop) {
+			publish_one((mod_nats_pub_t *) pop);
 		}
-
-		switch_safe_free(pub->subject);
-		switch_safe_free(pub->reply);
-		switch_safe_free(pub->payload);
-		switch_safe_free(pub->request_id);
-		switch_safe_free(pub);
 	}
 
 	return NULL;
@@ -137,6 +189,7 @@ static void on_node_message(natsConnection *nc, natsSubscription *sub, natsMsg *
 		switch_safe_free(req->subject);
 		switch_safe_free(req->reply);
 		switch_safe_free(req->payload);
+		switch_safe_free(req->request_id);
 		switch_safe_free(req);
 	}
 
@@ -241,11 +294,14 @@ switch_status_t mod_nats_conn_start(void)
 	mod_nats_globals.conn_state = (natsConnection_Status(mod_nats_globals.nc) == NATS_CONN_STATUS_CONNECTED) ? MN_CONN_UP : MN_CONN_CONNECTING;
 	switch_mutex_unlock(mod_nats_globals.mutex);
 
+	mod_nats_js_ensure();
+
 	switch_threadattr_create(&thd_attr, mod_nats_globals.pool);
 	switch_threadattr_stacksize_set(thd_attr, SWITCH_THREAD_STACKSIZE);
-	switch_threadattr_detach_set(thd_attr, 1);
+	/* joinable: shutdown joins this thread before destroying the connection */
 	status = switch_thread_create(&mod_nats_globals.pub_thread, thd_attr, publisher_thread, NULL, mod_nats_globals.pool);
 	if (status != SWITCH_STATUS_SUCCESS) {
+		mod_nats_conn_stop();
 		return status;
 	}
 
@@ -257,8 +313,73 @@ switch_status_t mod_nats_conn_start(void)
 	return SWITCH_STATUS_SUCCESS;
 }
 
+void mod_nats_js_ensure(void)
+{
+	jsOptions opts;
+	jsCtx *created = NULL;
+	natsConnection *nc = NULL;
+	natsStatus ns = NATS_ERR;
+	static int binding = 0;
+	static switch_time_t next_try = 0;
+
+	if (mod_nats_globals.js_cdr != SWITCH_TRUE && mod_nats_globals.js_metrics != SWITCH_TRUE) {
+		return;
+	}
+
+	switch_mutex_lock(mod_nats_globals.mutex);
+	if (mod_nats_globals.js || !mod_nats_globals.nc || binding) {
+		switch_mutex_unlock(mod_nats_globals.mutex);
+		return;
+	}
+	if (next_try && switch_time_now() < next_try) {
+		switch_mutex_unlock(mod_nats_globals.mutex);
+		return;
+	}
+	binding = 1;
+	nc = mod_nats_globals.nc;
+	switch_mutex_unlock(mod_nats_globals.mutex);
+
+	/* JetStream() can touch the socket; do not hold mod_nats mutex across it */
+	jsOptions_Init(&opts);
+	opts.Wait = 1000;
+	ns = natsConnection_JetStream(&created, nc, &opts);
+
+	switch_mutex_lock(mod_nats_globals.mutex);
+	binding = 0;
+	if (ns == NATS_OK && created && !mod_nats_globals.js && mod_nats_globals.nc == nc) {
+		mod_nats_globals.js = created;
+		created = NULL;
+		next_try = 0;
+	} else if (ns != NATS_OK) {
+		next_try = switch_time_now() + (5 * 1000000);
+	}
+	switch_mutex_unlock(mod_nats_globals.mutex);
+
+	if (created) {
+		jsCtx_Destroy(created);
+	}
+	if (ns == NATS_OK && !created) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, MOD_NATS_NAME " JetStream context bound\n");
+	} else if (ns != NATS_OK) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+						  MOD_NATS_NAME " JetStream unavailable (%s), core NATS only\n", natsStatus_GetText(ns));
+	}
+}
+
 void mod_nats_conn_stop(void)
 {
+	jsCtx *js = NULL;
+
+	/* jsCtx holds the connection: drop it first, and only after the publisher has been joined */
+	switch_mutex_lock(mod_nats_globals.mutex);
+	js = mod_nats_globals.js;
+	mod_nats_globals.js = NULL;
+	mod_nats_globals.conn_state = MN_CONN_DOWN;
+	switch_mutex_unlock(mod_nats_globals.mutex);
+	if (js) {
+		jsCtx_Destroy(js);
+	}
+
 	if (mod_nats_globals.sub_node) {
 		natsSubscription_Destroy(mod_nats_globals.sub_node);
 		mod_nats_globals.sub_node = NULL;
@@ -267,7 +388,4 @@ void mod_nats_conn_stop(void)
 		natsConnection_Destroy(mod_nats_globals.nc);
 		mod_nats_globals.nc = NULL;
 	}
-	switch_mutex_lock(mod_nats_globals.mutex);
-	mod_nats_globals.conn_state = MN_CONN_DOWN;
-	switch_mutex_unlock(mod_nats_globals.mutex);
 }

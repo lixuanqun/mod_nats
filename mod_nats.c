@@ -93,6 +93,18 @@ static switch_status_t config_load(switch_bool_t reload)
 				mod_nats_globals.metrics_interval = atoi(val);
 			} else if (!strcmp(name, "compat-xcc")) {
 				mod_nats_globals.compat_xcc = switch_true(val);
+			} else if (!strcmp(name, "js-cdr")) {
+				mod_nats_globals.js_cdr = switch_true(val);
+			} else if (!strcmp(name, "js-metrics")) {
+				mod_nats_globals.js_metrics = switch_true(val);
+			} else if (!strcmp(name, "event-routing")) {
+				if (!strcasecmp(val, "mailbox")) {
+					mod_nats_globals.event_routing = EVENT_ROUTE_MAILBOX;
+				} else if (!strcasecmp(val, "broadcast")) {
+					mod_nats_globals.event_routing = EVENT_ROUTE_BROADCAST;
+				} else {
+					mod_nats_globals.event_routing = EVENT_ROUTE_BOTH;
+				}
 			} else if (!strcmp(name, "publish-native-events")) {
 				mod_nats_globals.publish_native_events = switch_true(val);
 			} else if (!strcmp(name, "workers")) {
@@ -121,12 +133,17 @@ static switch_status_t config_load(switch_bool_t reload)
 
 switch_status_t mod_nats_config_reload(void)
 {
-	return config_load(SWITCH_TRUE);
+	switch_status_t st = config_load(SWITCH_TRUE);
+
+	if (st == SWITCH_STATUS_SUCCESS) {
+		mod_nats_js_ensure();
+	}
+	return st;
 }
 
 static switch_status_t api_status(switch_stream_handle_t *stream)
 {
-	uint64_t in, out, dropped, errs, ev, since;
+	uint64_t in, out, dropped, errs, ev, since, js_fb;
 
 	switch_mutex_lock(mod_nats_globals.mutex);
 	in = mod_nats_globals.msgs_in;
@@ -134,6 +151,7 @@ static switch_status_t api_status(switch_stream_handle_t *stream)
 	dropped = mod_nats_globals.msgs_dropped;
 	errs = mod_nats_globals.pub_errors;
 	ev = mod_nats_globals.events_out;
+	js_fb = mod_nats_globals.js_fallbacks;
 	since = (uint64_t) ((switch_time_now() - mod_nats_globals.started) / 1000000);
 	switch_mutex_unlock(mod_nats_globals.mutex);
 
@@ -143,6 +161,14 @@ static switch_status_t api_status(switch_stream_handle_t *stream)
 	stream->write_function(stream, "prefix        %s\n", mod_nats_globals.subject_prefix);
 	stream->write_function(stream, "node_uuid     %s\n", mod_nats_globals.node_uuid);
 	stream->write_function(stream, "listen        %s\n", mod_nats_subject_node());
+	stream->write_function(stream, "jetstream     cdr=%s metrics=%s ctx=%s fallbacks=%lu\n",
+						   mod_nats_globals.js_cdr ? "on" : "off",
+						   mod_nats_globals.js_metrics ? "on" : "off",
+						   mod_nats_globals.js ? "bound" : "none",
+						   (unsigned long) js_fb);
+	stream->write_function(stream, "routing       %s\n",
+						   mod_nats_globals.event_routing == EVENT_ROUTE_MAILBOX ? "mailbox" :
+						   mod_nats_globals.event_routing == EVENT_ROUTE_BOTH ? "both" : "broadcast");
 	stream->write_function(stream, "metrics       interval=%ds out=%lu\n",
 						   mod_nats_globals.metrics_interval, (unsigned long) mod_nats_globals.metrics_out);
 	stream->write_function(stream, "events        %s (native: %s) cdr: %s\n",
@@ -154,6 +180,9 @@ static switch_status_t api_status(switch_stream_handle_t *stream)
 	stream->write_function(stream, "events out    %lu\n", (unsigned long) ev);
 	stream->write_function(stream, "dropped       %lu\n", (unsigned long) dropped);
 	stream->write_function(stream, "pub errors    %lu\n", (unsigned long) errs);
+	stream->write_function(stream, "dial          workers=%d queued=%u\n",
+						   mod_nats_globals.dial_thread_count,
+						   mod_nats_globals.dial_queue ? switch_queue_size(mod_nats_globals.dial_queue) : 0);
 	stream->write_function(stream, "sessions      %lu\n", (unsigned long) switch_core_session_count());
 	stream->write_function(stream, "======================================\n");
 	return SWITCH_STATUS_SUCCESS;
@@ -192,6 +221,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_nats_load)
 	mod_nats_globals.enable_cdr = SWITCH_TRUE;
 	mod_nats_globals.accept_timeout_sec = 10;
 	mod_nats_globals.compat_xcc = SWITCH_TRUE;
+	mod_nats_globals.event_routing = EVENT_ROUTE_BOTH;
 	switch_copy_string(mod_nats_globals.urls, "nats://127.0.0.1:4222", sizeof(mod_nats_globals.urls));
 	switch_copy_string(mod_nats_globals.subject_prefix, MOD_NATS_DEFAULT_PREFIX, sizeof(mod_nats_globals.subject_prefix));
 
@@ -204,6 +234,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_nats_load)
 	switch_core_hash_init(&mod_nats_globals.chan_hash);
 	switch_queue_create(&mod_nats_globals.pub_queue, mod_nats_globals.pub_qlen, pool);
 	switch_queue_create(&mod_nats_globals.req_queue, mod_nats_globals.req_qlen, pool);
+	switch_queue_create(&mod_nats_globals.dial_queue, mod_nats_globals.req_qlen, pool);
 
 	SWITCH_ADD_API(api_interface, "nats", "NATS bus interface", api_function, "status | reload");
 	switch_console_set_complete("add nats status");
@@ -213,6 +244,8 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_nats_load)
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, MOD_NATS_NAME " connection failed; module not loaded\n");
 		return SWITCH_STATUS_FALSE;
 	}
+
+	mod_nats_methods_dial_start();
 
 	for (i = 0; i < mod_nats_globals.workers; i++) {
 		switch_threadattr_create(&thd_attr, pool);
@@ -225,6 +258,20 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_nats_load)
 
 	if ((status = mod_nats_events_start()) != SWITCH_STATUS_SUCCESS) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, MOD_NATS_NAME " event bind failed\n");
+		mod_nats_globals.running = SWITCH_FALSE;
+		switch_queue_interrupt_all(mod_nats_globals.req_queue);
+		for (i = 0; i < mod_nats_globals.req_thread_count; i++) {
+			switch_status_t join_status;
+			switch_thread_join(&join_status, mod_nats_globals.req_threads[i]);
+		}
+		mod_nats_methods_dial_stop();
+		mod_nats_globals.pub_stop = SWITCH_TRUE;
+		switch_queue_interrupt_all(mod_nats_globals.pub_queue);
+		if (mod_nats_globals.pub_thread) {
+			switch_status_t join_status;
+			switch_thread_join(&join_status, mod_nats_globals.pub_thread);
+		}
+		mod_nats_conn_stop();
 		return SWITCH_STATUS_FALSE;
 	}
 
@@ -251,11 +298,14 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_nats_shutdown)
 	mod_nats_metrics_stop();
 	switch_sleep(250000);
 	switch_queue_interrupt_all(mod_nats_globals.req_queue);
-	switch_queue_interrupt_all(mod_nats_globals.pub_queue);
 	/* apr_thread_join dereferences retval unconditionally - never pass NULL */
 	for (i = 0; i < mod_nats_globals.req_thread_count; i++) {
 		switch_thread_join(&join_status, mod_nats_globals.req_threads[i]);
 	}
+	/* dial threads may still be inside originate; they enqueue Event.Result before exiting */
+	mod_nats_methods_dial_stop();
+	mod_nats_globals.pub_stop = SWITCH_TRUE;
+	switch_queue_interrupt_all(mod_nats_globals.pub_queue);
 	if (mod_nats_globals.pub_thread) {
 		switch_thread_join(&join_status, mod_nats_globals.pub_thread);
 	}
