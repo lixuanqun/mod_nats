@@ -6,18 +6,65 @@
  *  - cnats delivers subscription messages on its own threads; the handler
  *    only copies and enqueues, never blocks, never touches FS core.
  *  - Request workers (nats_proto.c) drain req_queue and execute FS calls.
- *  - A single publisher thread drains pub_queue so FS event callbacks are
- *    never blocked by socket I/O; overflow drops and counts.
+ *  - reply_queue carries RPC replies and Event.Result. Its thread never
+ *    waits on a JetStream ack.
+ *  - pub_queue carries channel events and node announcements on core NATS.
+ *  - js_queue carries CDR and metrics. A JetStream ack cannot stall the
+ *    channel-event publisher.
+ *  While the connection is down a publisher holds the current message and
+ *  leaves the rest queued; it does not drain-and-drop across a reconnect.
  */
 #include "mod_nats.h"
 
-static void publish_one(mod_nats_pub_t *pub)
+static int conn_is_up(void)
 {
+	natsConnection *nc;
+
+	switch_mutex_lock(mod_nats_globals.mutex);
+	nc = mod_nats_globals.nc;
+	switch_mutex_unlock(mod_nats_globals.mutex);
+	return nc && natsConnection_Status(nc) == NATS_CONN_STATUS_CONNECTED;
+}
+
+/* Block only this message. The rest of the queue stays put until the
+ * connection is back. pub_stop ends the wait so unload cannot hang here. */
+static void wait_until_connected(void)
+{
+	while (!mod_nats_globals.pub_stop && !conn_is_up()) {
+		switch_sleep(100000);
+	}
+}
+
+/* One warning per second. Every failure is still counted. */
+static int warn_due(void)
+{
+	static switch_time_t last = 0;
+	switch_time_t now = switch_time_now();
+
+	if (last && (now - last) < 1000000) {
+		return 0;
+	}
+	last = now;
+	return 1;
+}
+
+static void publish_one(mod_nats_pub_t *pub, int allow_js)
+{
+	natsConnection *nc;
+
 	if (!pub) {
 		return;
 	}
 
-	if (mod_nats_globals.nc && (natsConnection_Status(mod_nats_globals.nc) == NATS_CONN_STATUS_CONNECTED)) {
+	if (!conn_is_up()) {
+		wait_until_connected();
+	}
+
+	switch_mutex_lock(mod_nats_globals.mutex);
+	nc = mod_nats_globals.nc;
+	switch_mutex_unlock(mod_nats_globals.mutex);
+
+	if (nc && natsConnection_Status(nc) == NATS_CONN_STATUS_CONNECTED) {
 		natsStatus ns = NATS_ERR;
 		jsCtx *js = NULL;
 		int via_js;
@@ -26,13 +73,13 @@ static void publish_one(mod_nats_pub_t *pub)
 		switch_mutex_lock(mod_nats_globals.mutex);
 		js = mod_nats_globals.js;
 		switch_mutex_unlock(mod_nats_globals.mutex);
-		if (!js && mod_nats_subject_is_persistent(pub->subject)) {
+		if (allow_js && !js && mod_nats_subject_is_persistent(pub->subject)) {
 			mod_nats_js_ensure();
 			switch_mutex_lock(mod_nats_globals.mutex);
 			js = mod_nats_globals.js;
 			switch_mutex_unlock(mod_nats_globals.mutex);
 		}
-		via_js = (js != NULL) && mod_nats_subject_is_persistent(pub->subject);
+		via_js = allow_js && (js != NULL) && mod_nats_subject_is_persistent(pub->subject);
 
 		if (via_js) {
 			jsPubAck *pa = NULL;
@@ -49,17 +96,21 @@ static void publish_one(mod_nats_pub_t *pub)
 				jsPubAck_Destroy(pa);
 			}
 			if (ns == NATS_TIMEOUT) {
-				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
-								  MOD_NATS_NAME " JetStream ack timeout for '%s'; not republishing\n",
-								  pub->subject);
+				if (warn_due()) {
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+									  MOD_NATS_NAME " JetStream ack timeout for '%s'; not republishing\n",
+									  pub->subject);
+				}
 			} else if (ns != NATS_OK) {
-				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
-								  MOD_NATS_NAME " JetStream publish to '%s' failed: %s; core NATS fallback\n",
-								  pub->subject, natsStatus_GetText(ns));
+				if (warn_due()) {
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+									  MOD_NATS_NAME " JetStream publish to '%s' failed: %s; core NATS fallback\n",
+									  pub->subject, natsStatus_GetText(ns));
+				}
 				switch_mutex_lock(mod_nats_globals.mutex);
 				mod_nats_globals.js_fallbacks++;
 				switch_mutex_unlock(mod_nats_globals.mutex);
-				ns = natsConnection_Publish(mod_nats_globals.nc, pub->subject,
+				ns = natsConnection_Publish(nc, pub->subject,
 										   (const void *) pub->payload, (int) strlen(pub->payload));
 			}
 		} else if (!zstr(pub->request_id)) {
@@ -67,24 +118,26 @@ static void publish_one(mod_nats_pub_t *pub)
 			if (natsMsg_Create(&hm, pub->subject, zstr(pub->reply) ? NULL : pub->reply,
 								  pub->payload, (int) strlen(pub->payload)) == NATS_OK) {
 				natsMsgHeader_Set(hm, "X-Request-Id", pub->request_id);
-				ns = natsConnection_PublishMsg(mod_nats_globals.nc, hm);
+				ns = natsConnection_PublishMsg(nc, hm);
 				natsMsg_Destroy(hm);
 			} else {
 				ns = NATS_ERR;
 			}
 		} else if (!zstr(pub->reply)) {
-			ns = natsConnection_PublishRequest(mod_nats_globals.nc, pub->subject, pub->reply,
+			ns = natsConnection_PublishRequest(nc, pub->subject, pub->reply,
 											   (const void *) pub->payload, (int) strlen(pub->payload));
 		} else {
-			ns = natsConnection_Publish(mod_nats_globals.nc, pub->subject,
+			ns = natsConnection_Publish(nc, pub->subject,
 										(const void *) pub->payload, (int) strlen(pub->payload));
 		}
 		if (ns == NATS_OK) {
 			switch_mutex_lock(mod_nats_globals.mutex);
 			mod_nats_globals.msgs_out++;
 			switch_mutex_unlock(mod_nats_globals.mutex);
+		} else if (ns == NATS_TIMEOUT) {
+			/* Already logged. The server may have stored the message, so this is not pub_errors. */
 		} else {
-			if (ns != NATS_TIMEOUT) {
+			if (warn_due()) {
 				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
 								  MOD_NATS_NAME " publish to '%s' failed: %s\n", pub->subject, natsStatus_GetText(ns));
 			}
@@ -105,32 +158,47 @@ static void publish_one(mod_nats_pub_t *pub)
 	switch_safe_free(pub);
 }
 
-static void *SWITCH_THREAD_FUNC publisher_thread(switch_thread_t *t, void *data)
+static void publisher_loop(switch_queue_t *queue, int allow_js)
 {
 	/* pub_stop is raised only after dial threads have enqueued their last results */
 	while (!mod_nats_globals.pub_stop) {
 		void *pop = NULL;
-		switch_status_t st = switch_queue_pop(mod_nats_globals.pub_queue, &pop);
+		switch_status_t st = switch_queue_pop_timeout(queue, &pop, 200000);
 
+		if (pop) {
+			publish_one((mod_nats_pub_t *) pop, allow_js);
+		}
 		if (mod_nats_globals.pub_stop) {
-			if (pop) {
-				publish_one((mod_nats_pub_t *) pop);
-			}
 			break;
 		}
-		if (st != SWITCH_STATUS_SUCCESS || !pop) {
+		if (st != SWITCH_STATUS_SUCCESS) {
 			continue;
 		}
-		publish_one((mod_nats_pub_t *) pop);
 	}
 
 	{
 		void *pop = NULL;
-		while (switch_queue_trypop(mod_nats_globals.pub_queue, &pop) == SWITCH_STATUS_SUCCESS && pop) {
-			publish_one((mod_nats_pub_t *) pop);
+		while (switch_queue_trypop(queue, &pop) == SWITCH_STATUS_SUCCESS && pop) {
+			publish_one((mod_nats_pub_t *) pop, allow_js);
 		}
 	}
+}
 
+static void *SWITCH_THREAD_FUNC publisher_thread(switch_thread_t *t, void *data)
+{
+	publisher_loop(mod_nats_globals.pub_queue, 0);
+	return NULL;
+}
+
+static void *SWITCH_THREAD_FUNC js_publisher_thread(switch_thread_t *t, void *data)
+{
+	publisher_loop(mod_nats_globals.js_queue, 1);
+	return NULL;
+}
+
+static void *SWITCH_THREAD_FUNC reply_thread(switch_thread_t *t, void *data)
+{
+	publisher_loop(mod_nats_globals.reply_queue, 0);
 	return NULL;
 }
 
@@ -143,6 +211,21 @@ static void on_node_message(natsConnection *nc, natsSubscription *sub, natsMsg *
 	const char *data = natsMsg_GetData(msg);
 	int len = (int) natsMsg_GetDataLength(msg);
 
+	if (len < 0 || (size_t) len > MOD_NATS_MAX_PAYLOAD) {
+		switch_mutex_lock(mod_nats_globals.mutex);
+		mod_nats_globals.msgs_dropped++;
+		switch_mutex_unlock(mod_nats_globals.mutex);
+		if (warn_due()) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+							  MOD_NATS_NAME " dropping oversized payload (%d bytes)\n", len);
+		}
+		if (!zstr(reply)) {
+			mod_nats_proto_send_error(reply, "", 400, "payload too large");
+		}
+		natsMsg_Destroy(msg);
+		return;
+	}
+
 	/* transient object: malloc/free, not pool memory (requests are unbounded) */
 	req = (mod_nats_req_t *) malloc(sizeof(*req));
 	if (!req) {
@@ -154,6 +237,13 @@ static void on_node_message(natsConnection *nc, natsSubscription *sub, natsMsg *
 	req->reply = zstr(reply) ? NULL : strdup(reply);
 	if (len > 0) {
 		req->payload = (char *) malloc((size_t) len + 1);
+		if (!req->payload) {
+			switch_safe_free(req->subject);
+			switch_safe_free(req->reply);
+			switch_safe_free(req);
+			natsMsg_Destroy(msg);
+			return;
+		}
 		memcpy(req->payload, data, (size_t) len);
 		req->payload[len] = '\0';
 	} else {
@@ -182,7 +272,9 @@ static void on_node_message(natsConnection *nc, natsSubscription *sub, natsMsg *
 		switch_mutex_lock(mod_nats_globals.mutex);
 		mod_nats_globals.msgs_dropped++;
 		switch_mutex_unlock(mod_nats_globals.mutex);
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, MOD_NATS_NAME " request queue full, replying 503\n");
+		if (warn_due()) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, MOD_NATS_NAME " request queue full, replying 503\n");
+		}
 		if (!zstr(reply)) {
 			mod_nats_proto_send_error(reply, "", 503, "request queue full");
 		}
@@ -196,11 +288,11 @@ static void on_node_message(natsConnection *nc, natsSubscription *sub, natsMsg *
 	natsMsg_Destroy(msg);
 }
 
-switch_status_t mod_nats_publish_enqueue_hdr(const char *subject, const char *reply, const char *payload, const char *request_id)
+static switch_status_t enqueue_pub(switch_queue_t *queue, const char *subject, const char *reply, const char *payload, const char *request_id)
 {
 	mod_nats_pub_t *pub;
 
-	if (zstr(subject) || zstr(payload)) {
+	if (!queue || zstr(subject) || zstr(payload)) {
 		return SWITCH_STATUS_FALSE;
 	}
 
@@ -214,7 +306,7 @@ switch_status_t mod_nats_publish_enqueue_hdr(const char *subject, const char *re
 	pub->payload = strdup(payload);
 	pub->request_id = zstr(request_id) ? NULL : strdup(request_id);
 
-	if (!pub->subject || !pub->payload || switch_queue_trypush(mod_nats_globals.pub_queue, pub) != SWITCH_STATUS_SUCCESS) {
+	if (!pub->subject || !pub->payload || switch_queue_trypush(queue, pub) != SWITCH_STATUS_SUCCESS) {
 		switch_safe_free(pub->subject);
 		switch_safe_free(pub->reply);
 		switch_safe_free(pub->payload);
@@ -229,9 +321,20 @@ switch_status_t mod_nats_publish_enqueue_hdr(const char *subject, const char *re
 	return SWITCH_STATUS_SUCCESS;
 }
 
+switch_status_t mod_nats_publish_enqueue_hdr(const char *subject, const char *reply, const char *payload, const char *request_id)
+{
+	/* Replies and Event.Result stay off the event queue so a JetStream ack cannot stall them. */
+	return enqueue_pub(mod_nats_globals.reply_queue, subject, reply, payload, request_id);
+}
+
 switch_status_t mod_nats_publish_enqueue(const char *subject, const char *reply, const char *payload)
 {
-	return mod_nats_publish_enqueue_hdr(subject, reply, payload, NULL);
+	switch_queue_t *queue = mod_nats_globals.pub_queue;
+
+	if (mod_nats_globals.js_queue && mod_nats_subject_is_persistent(subject)) {
+		queue = mod_nats_globals.js_queue;
+	}
+	return enqueue_pub(queue, subject, reply, payload, NULL);
 }
 const char *mod_nats_conn_state_name(void)
 {
@@ -282,6 +385,15 @@ switch_status_t mod_nats_conn_start(void)
 
 	ns = natsConnection_Subscribe(&mod_nats_globals.sub_node, mod_nats_globals.nc,
 								  mod_nats_subject_node(), on_node_message, NULL);
+	if (ns == NATS_OK) {
+		/* Slow request workers must not grow the cnats buffer without a bound. */
+		ns = natsSubscription_SetPendingLimits(mod_nats_globals.sub_node, 4096, 8 * 1024 * 1024);
+		if (ns != NATS_OK) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+							  MOD_NATS_NAME " pending limits not applied: %s\n", natsStatus_GetText(ns));
+			ns = NATS_OK;
+		}
+	}
 	if (ns != NATS_OK) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, MOD_NATS_NAME " subscribe '%s' failed: %s\n",
 						  mod_nats_subject_node(), natsStatus_GetText(ns));
@@ -298,9 +410,25 @@ switch_status_t mod_nats_conn_start(void)
 
 	switch_threadattr_create(&thd_attr, mod_nats_globals.pool);
 	switch_threadattr_stacksize_set(thd_attr, SWITCH_THREAD_STACKSIZE);
-	/* joinable: shutdown joins this thread before destroying the connection */
+	/* joinable: shutdown joins these threads before destroying the connection */
 	status = switch_thread_create(&mod_nats_globals.pub_thread, thd_attr, publisher_thread, NULL, mod_nats_globals.pool);
 	if (status != SWITCH_STATUS_SUCCESS) {
+		mod_nats_conn_stop();
+		return status;
+	}
+	switch_threadattr_create(&thd_attr, mod_nats_globals.pool);
+	switch_threadattr_stacksize_set(thd_attr, SWITCH_THREAD_STACKSIZE);
+	status = switch_thread_create(&mod_nats_globals.js_thread, thd_attr, js_publisher_thread, NULL, mod_nats_globals.pool);
+	if (status != SWITCH_STATUS_SUCCESS) {
+		mod_nats_publishers_stop();
+		mod_nats_conn_stop();
+		return status;
+	}
+	switch_threadattr_create(&thd_attr, mod_nats_globals.pool);
+	switch_threadattr_stacksize_set(thd_attr, SWITCH_THREAD_STACKSIZE);
+	status = switch_thread_create(&mod_nats_globals.reply_thread, thd_attr, reply_thread, NULL, mod_nats_globals.pool);
+	if (status != SWITCH_STATUS_SUCCESS) {
+		mod_nats_publishers_stop();
 		mod_nats_conn_stop();
 		return status;
 	}
@@ -363,6 +491,34 @@ void mod_nats_js_ensure(void)
 	} else if (ns != NATS_OK) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
 						  MOD_NATS_NAME " JetStream unavailable (%s), core NATS only\n", natsStatus_GetText(ns));
+	}
+}
+
+void mod_nats_publishers_stop(void)
+{
+	switch_status_t join_status;
+
+	mod_nats_globals.pub_stop = SWITCH_TRUE;
+	if (mod_nats_globals.pub_queue) {
+		switch_queue_interrupt_all(mod_nats_globals.pub_queue);
+	}
+	if (mod_nats_globals.js_queue) {
+		switch_queue_interrupt_all(mod_nats_globals.js_queue);
+	}
+	if (mod_nats_globals.reply_queue) {
+		switch_queue_interrupt_all(mod_nats_globals.reply_queue);
+	}
+	if (mod_nats_globals.pub_thread) {
+		switch_thread_join(&join_status, mod_nats_globals.pub_thread);
+		mod_nats_globals.pub_thread = NULL;
+	}
+	if (mod_nats_globals.js_thread) {
+		switch_thread_join(&join_status, mod_nats_globals.js_thread);
+		mod_nats_globals.js_thread = NULL;
+	}
+	if (mod_nats_globals.reply_thread) {
+		switch_thread_join(&join_status, mod_nats_globals.reply_thread);
+		mod_nats_globals.reply_thread = NULL;
 	}
 }
 

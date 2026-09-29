@@ -32,6 +32,11 @@
 #define MOD_NATS_DEFAULT_REQ_QLEN 2048
 #define MOD_NATS_DEFAULT_WORKERS 4
 #define MOD_NATS_DEFAULT_PUB_WAIT_MS 1000
+/* Every accept-timeout task shares this group so unload can delete them together. */
+#define MOD_NATS_SCHED_GROUP "mod_nats"
+#define MOD_NATS_MAX_OBSERVERS 32
+/* Reject larger RPC bodies in the cnats callback, before they are copied. */
+#define MOD_NATS_MAX_PAYLOAD (1024 * 1024)
 
 typedef enum {
 	MN_CONN_DOWN = 0,
@@ -59,6 +64,7 @@ typedef struct mod_nats_req_s {
  * (XNode.Dial) correlate the Event.Result with the original rpc id. */
 typedef struct mod_nats_req_ctx_s {
 	char rpc_id[128];				/* "" when the request is a notification */
+	int rpc_id_is_number;			/* request id was a JSON number, echo it as a number */
 	char ctrl_uuid[SWITCH_UUID_FORMATTED_LENGTH + 1];
 	char request_id[128];			/* X-Request-Id header value, "" when absent */
 } mod_nats_req_ctx_t;
@@ -77,6 +83,7 @@ typedef struct mod_nats_chan_s {
 	char ctrl_uuid[SWITCH_UUID_FORMATTED_LENGTH + 1]; /* "" until Accept */
 	char *params_csv;				/* per-channel channel_params whitelist */
 	mod_nats_obs_t *observers;
+	uint32_t accept_task_id;		/* scheduler id, 0 when no accept-timeout is armed */
 } mod_nats_chan_t;
 
 struct mod_nats_globals_s {
@@ -91,6 +98,7 @@ struct mod_nats_globals_s {
 	char *password;
 	char *credentials;
 	switch_bool_t tls_verify;
+	switch_bool_t allow_native_api;	/* fs.native.api / fs.native.jsapi, default off */
 	char *cdr_subject;				/* default "<prefix>cdr" */
 	switch_bool_t enable_events;
 	switch_bool_t enable_cdr;
@@ -117,17 +125,25 @@ struct mod_nats_globals_s {
 	switch_bool_t compat_xcc;		/* route XNode.* aliases (default on) */
 	switch_bool_t js_cdr;			/* CDR via JetStream (stream configured server-side) */
 	switch_bool_t js_metrics;		/* metrics heartbeat via JetStream */
-	switch_queue_t *pub_queue;
+	switch_queue_t *pub_queue;		/* channel events and node announcements; core NATS only */
+	switch_queue_t *js_queue;		/* CDR and metrics; JetStream ack stays off the event path */
+	switch_queue_t *reply_queue;	/* RPC replies and Event.Result; never waits on JetStream */
+	switch_queue_t *event_queue;	/* duplicated FS events waiting to be serialized */
 	switch_queue_t *req_queue;
 	switch_queue_t *dial_queue;
 	switch_thread_t *pub_thread;
+	switch_thread_t *js_thread;
+	switch_thread_t *reply_thread;
+	switch_thread_t *event_thread;
 	switch_thread_t *metrics_thread;
+	switch_mutex_t *cpu_mutex;		/* /proc cpu sample shared by JStatus and metrics */
 	jsCtx *js;						/* JetStream context, NULL when unused */
 	switch_thread_t *req_threads[16];
 	int req_thread_count;
 	switch_thread_t *dial_threads[16];
 	int dial_thread_count;
-	switch_bool_t pub_stop;			/* publisher exits only after dial threads have finished */
+	switch_bool_t pub_stop;			/* reply + event publishers exit only after dial threads finish */
+	switch_bool_t event_stop;		/* serializer exits after the FS event bind is gone */
 
 	/* stats (atomic-ish under mutex) */
 	uint64_t msgs_in;
@@ -155,6 +171,8 @@ extern const mod_nats_method_t mod_nats_methods[];
 switch_status_t mod_nats_publish_enqueue_hdr(const char *subject, const char *reply, const char *payload, const char *request_id);
 switch_status_t mod_nats_conn_start(void);
 void mod_nats_conn_stop(void);
+/* Raise pub_stop, interrupt the three publisher queues, and join any thread that was started. */
+void mod_nats_publishers_stop(void);
 void mod_nats_js_ensure(void);
 switch_status_t mod_nats_publish_enqueue(const char *subject, const char *reply, const char *payload);
 const char *mod_nats_conn_state_name(void);
@@ -162,7 +180,7 @@ const char *mod_nats_conn_state_name(void);
 /* nats_proto.c */
 void mod_nats_proto_handle_request(mod_nats_req_t *req);
 void mod_nats_proto_send_reply(const char *reply, const char *rpc_id, cJSON *result);
-void mod_nats_proto_send_reply_hdr(const char *reply, const char *rpc_id, const char *rpc_id_header, cJSON *result);
+void mod_nats_proto_send_reply_hdr(const char *reply, const char *rpc_id, int rpc_id_is_number, const char *rpc_id_header, cJSON *result);
 void mod_nats_proto_send_error(const char *reply, const char *rpc_id, int code, const char *message);
 const char *mod_nats_subject_node(void);
 const char *mod_nats_subject_ctrl(const char *ctrl_uuid);
@@ -180,7 +198,11 @@ void mod_nats_methods_dial_stop(void);
 switch_bool_t mod_nats_methods_channel_owned(const char *uuid);
 void mod_nats_methods_channel_params_copy(const char *uuid, char *buf, size_t buflen);
 void mod_nats_methods_snapshot_audience(const char *uuid, char *owner, size_t owner_len, mod_nats_obs_t **obs);
+/* Copy owner and observer ids under the channel lock. No allocation. Returns observer count. */
+int mod_nats_methods_copy_audience(const char *uuid, char *owner, size_t owner_len,
+								   char obs[][SWITCH_UUID_FORMATTED_LENGTH + 1], int max_obs);
 void mod_nats_obs_list_free(mod_nats_obs_t *obs);
+void mod_nats_methods_arm_accept_timeout(const char *uuid);
 
 /* nats_events.c */
 cJSON *mod_nats_events_capabilities(void);
@@ -188,8 +210,11 @@ void mod_nats_events_publish_nodeup(void);
 switch_status_t mod_nats_events_start(void);
 switch_status_t mod_nats_metrics_start(void);
 void mod_nats_metrics_stop(void);
+void mod_nats_events_unbind(void);
+void mod_nats_events_shutdown(void);
 void mod_nats_events_stop(void);
-void mod_nats_events_send_result(const char *ctrl_uuid, const char *rpc_id, cJSON *result);
+void mod_nats_events_rebind(void);
+void mod_nats_events_send_result(const char *ctrl_uuid, const char *rpc_id, int rpc_id_is_number, cJSON *result);
 void mod_nats_event_fill_channel_params(switch_event_t *event, cJSON *params, const char *uuid);
 
 /* mod_nats.c */

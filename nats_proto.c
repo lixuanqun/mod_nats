@@ -64,8 +64,20 @@ const char *mod_nats_subject_metrics(void)
 
 const char *mod_nats_subject_cdr(void)
 {
+	static MOD_NATS_TLS char buf[512];
+
+	if (mod_nats_globals.mutex) {
+		switch_mutex_lock(mod_nats_globals.mutex);
+	}
 	if (!zstr(mod_nats_globals.cdr_subject)) {
-		return mod_nats_globals.cdr_subject;
+		switch_copy_string(buf, mod_nats_globals.cdr_subject, sizeof(buf));
+		if (mod_nats_globals.mutex) {
+			switch_mutex_unlock(mod_nats_globals.mutex);
+		}
+		return buf;
+	}
+	if (mod_nats_globals.mutex) {
+		switch_mutex_unlock(mod_nats_globals.mutex);
 	}
 	return mod_nats_subject_event("cdr");
 }
@@ -79,7 +91,7 @@ static cJSON *build_result(int code, const char *message)
 	return result;
 }
 
-void mod_nats_proto_send_reply_hdr(const char *reply, const char *rpc_id, const char *rpc_id_header, cJSON *result)
+void mod_nats_proto_send_reply_hdr(const char *reply, const char *rpc_id, int rpc_id_is_number, const char *rpc_id_header, cJSON *result)
 {
 	cJSON *env;
 	char *payload;
@@ -96,6 +108,8 @@ void mod_nats_proto_send_reply_hdr(const char *reply, const char *rpc_id, const 
 	if (zstr(rpc_id)) {
 		/* JSON-RPC 2.0: unknown request id is reported as null */
 		cJSON_AddNullToObject(env, "id");
+	} else if (rpc_id_is_number) {
+		cJSON_AddNumberToObject(env, "id", atof(rpc_id));
 	} else {
 		cJSON_AddStringToObject(env, "id", rpc_id);
 	}
@@ -111,12 +125,12 @@ void mod_nats_proto_send_reply_hdr(const char *reply, const char *rpc_id, const 
 
 void mod_nats_proto_send_reply(const char *reply, const char *rpc_id, cJSON *result)
 {
-	mod_nats_proto_send_reply_hdr(reply, rpc_id, NULL, result);
+	mod_nats_proto_send_reply_hdr(reply, rpc_id, 0, NULL, result);
 }
 
 void mod_nats_proto_send_error(const char *reply, const char *rpc_id, int code, const char *message)
 {
-	mod_nats_proto_send_reply_hdr(reply, rpc_id, NULL, build_result(code, message));
+	mod_nats_proto_send_reply_hdr(reply, rpc_id, 0, NULL, build_result(code, message));
 }
 
 static const mod_nats_method_t *find_method(const char *name)
@@ -144,6 +158,7 @@ void mod_nats_proto_handle_request(mod_nats_req_t *req)
 	const mod_nats_method_t *m;
 	char rpc_id[128] = "";
 	char req_hdr[128] = "";
+	int rpc_id_is_number = 0;
 	switch_status_t st;
 	int code = 200;
 	const char *msg = "OK";
@@ -171,6 +186,13 @@ void mod_nats_proto_handle_request(mod_nats_req_t *req)
 
 	if (id && cJSON_IsString(id) && !zstr(id->valuestring)) {
 		switch_copy_string(rpc_id, id->valuestring, sizeof(rpc_id));
+	} else if (id && cJSON_IsNumber(id)) {
+		rpc_id_is_number = 1;
+		if (id->valuedouble == (double) id->valueint) {
+			snprintf(rpc_id, sizeof(rpc_id), "%d", id->valueint);
+		} else {
+			snprintf(rpc_id, sizeof(rpc_id), "%g", id->valuedouble);
+		}
 	}
 	/* no id => notification: execute but never reply */
 
@@ -180,6 +202,7 @@ void mod_nats_proto_handle_request(mod_nats_req_t *req)
 		cJSON *jctrl = cJSON_GetObjectItem(params, "ctrl_uuid");
 		memset(&ctx, 0, sizeof(ctx));
 		switch_copy_string(ctx.rpc_id, rpc_id, sizeof(ctx.rpc_id));
+		ctx.rpc_id_is_number = rpc_id_is_number;
 		if (!zstr(req->request_id)) {
 			switch_copy_string(ctx.request_id, req->request_id, sizeof(ctx.request_id));
 		}
@@ -248,7 +271,7 @@ void mod_nats_proto_handle_request(mod_nats_req_t *req)
 				cJSON_Delete(item);
 			}
 		}
-		mod_nats_proto_send_reply_hdr(req->reply, rpc_id, req_hdr[0] ? req_hdr : NULL, result);
+		mod_nats_proto_send_reply_hdr(req->reply, rpc_id, rpc_id_is_number, req_hdr[0] ? req_hdr : NULL, result);
 	}
 
 	if (extra) {

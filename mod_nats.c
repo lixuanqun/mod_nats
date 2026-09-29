@@ -15,6 +15,18 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_nats_load);
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_nats_shutdown);
 SWITCH_MODULE_DEFINITION(mod_nats, mod_nats_load, mod_nats_shutdown, NULL);
 
+static void free_req(mod_nats_req_t *req)
+{
+	if (!req) {
+		return;
+	}
+	switch_safe_free(req->subject);
+	switch_safe_free(req->reply);
+	switch_safe_free(req->payload);
+	switch_safe_free(req->request_id);
+	switch_safe_free(req);
+}
+
 static void *SWITCH_THREAD_FUNC request_worker(switch_thread_t *t, void *data)
 {
 	while (mod_nats_globals.running) {
@@ -24,34 +36,69 @@ static void *SWITCH_THREAD_FUNC request_worker(switch_thread_t *t, void *data)
 		if (switch_queue_pop(mod_nats_globals.req_queue, &pop) != SWITCH_STATUS_SUCCESS || !pop) {
 			continue;
 		}
-		if (!mod_nats_globals.running) {
-			mod_nats_req_t *r = (mod_nats_req_t *) pop;
-			switch_safe_free(r->subject);
-			switch_safe_free(r->reply);
-			switch_safe_free(r->payload);
-			switch_safe_free(r->request_id);
-			switch_safe_free(r);
-			continue;
-		}
 
 		req = (mod_nats_req_t *) pop;
 		mod_nats_proto_handle_request(req);
-		switch_safe_free(req->subject);
-		switch_safe_free(req->reply);
-		switch_safe_free(req->payload);
-		switch_safe_free(req->request_id);
-		switch_safe_free(req);
+		free_req(req);
+	}
+
+	{
+		void *pop = NULL;
+		while (switch_queue_trypop(mod_nats_globals.req_queue, &pop) == SWITCH_STATUS_SUCCESS && pop) {
+			mod_nats_req_t *req = (mod_nats_req_t *) pop;
+			if (!zstr(req->reply)) {
+				mod_nats_proto_send_error(req->reply, "", 480, "shutting down");
+			}
+			free_req(req);
+		}
 	}
 	return NULL;
+}
+
+static int same_cstr(const char *a, const char *b)
+{
+	if (!a && !b) {
+		return 1;
+	}
+	if (!a || !b) {
+		return 0;
+	}
+	return strcmp(a, b) == 0;
 }
 
 static switch_status_t config_load(switch_bool_t reload)
 {
 	switch_xml_t cfg, xml, settings, param;
 	const char *val;
+	char urls_save[MOD_NATS_URLS_MAX];
+	char prefix_save[MOD_NATS_PREFIX_MAX];
+	char node_save[SWITCH_UUID_FORMATTED_LENGTH + 1];
+	char *user_save = NULL, *pass_save = NULL, *cred_save = NULL;
+	int workers_save = 0, pub_save = 0, req_save = 0;
+
+	if (reload) {
+		switch_copy_string(urls_save, mod_nats_globals.urls, sizeof(urls_save));
+		switch_copy_string(prefix_save, mod_nats_globals.subject_prefix, sizeof(prefix_save));
+		switch_copy_string(node_save, mod_nats_globals.node_uuid, sizeof(node_save));
+		workers_save = mod_nats_globals.workers;
+		pub_save = mod_nats_globals.pub_qlen;
+		req_save = mod_nats_globals.req_qlen;
+		if (mod_nats_globals.user) {
+			user_save = strdup(mod_nats_globals.user);
+		}
+		if (mod_nats_globals.password) {
+			pass_save = strdup(mod_nats_globals.password);
+		}
+		if (mod_nats_globals.credentials) {
+			cred_save = strdup(mod_nats_globals.credentials);
+		}
+	}
 
 	if (!(xml = switch_xml_open_cfg("nats.conf", &cfg, NULL))) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, MOD_NATS_NAME " cannot open nats.conf.xml\n");
+		switch_safe_free(user_save);
+		switch_safe_free(pass_save);
+		switch_safe_free(cred_save);
 		return SWITCH_STATUS_FALSE;
 	}
 
@@ -78,11 +125,23 @@ static switch_status_t config_load(switch_bool_t reload)
 				switch_safe_free(mod_nats_globals.credentials);
 				mod_nats_globals.credentials = strdup(val);
 			} else if (!strcmp(name, "cdr-subject")) {
+				if (reload && mod_nats_globals.mutex) {
+					switch_mutex_lock(mod_nats_globals.mutex);
+				}
 				switch_safe_free(mod_nats_globals.cdr_subject);
 				mod_nats_globals.cdr_subject = strdup(val);
+				if (reload && mod_nats_globals.mutex) {
+					switch_mutex_unlock(mod_nats_globals.mutex);
+				}
 			} else if (!strcmp(name, "channel-params")) {
+				if (reload && mod_nats_globals.mutex) {
+					switch_mutex_lock(mod_nats_globals.mutex);
+				}
 				switch_safe_free(mod_nats_globals.channel_params);
 				mod_nats_globals.channel_params = strdup(val);
+				if (reload && mod_nats_globals.mutex) {
+					switch_mutex_unlock(mod_nats_globals.mutex);
+				}
 			} else if (!strcmp(name, "publish-events")) {
 				mod_nats_globals.enable_events = switch_true(val);
 			} else if (!strcmp(name, "enable-cdr")) {
@@ -107,6 +166,8 @@ static switch_status_t config_load(switch_bool_t reload)
 				}
 			} else if (!strcmp(name, "publish-native-events")) {
 				mod_nats_globals.publish_native_events = switch_true(val);
+			} else if (!strcmp(name, "allow-native-api")) {
+				mod_nats_globals.allow_native_api = switch_true(val);
 			} else if (!strcmp(name, "workers")) {
 				mod_nats_globals.workers = atoi(val);
 			} else if (!strcmp(name, "pub-qsize")) {
@@ -118,7 +179,7 @@ static switch_status_t config_load(switch_bool_t reload)
 	}
 	switch_xml_free(xml);
 
-	if (zstr(mod_nats_globals.node_uuid)) {
+	if (!reload && zstr(mod_nats_globals.node_uuid)) {
 		switch_uuid_str(mod_nats_globals.node_uuid, sizeof(mod_nats_globals.node_uuid));
 	}
 
@@ -127,6 +188,41 @@ static switch_status_t config_load(switch_bool_t reload)
 	if (mod_nats_globals.pub_qlen < 64) mod_nats_globals.pub_qlen = MOD_NATS_DEFAULT_PUB_QLEN;
 	if (mod_nats_globals.req_qlen < 16) mod_nats_globals.req_qlen = MOD_NATS_DEFAULT_REQ_QLEN;
 	if (mod_nats_globals.metrics_interval > 3600) mod_nats_globals.metrics_interval = 3600;
+	if (mod_nats_globals.accept_timeout_sec < 0) mod_nats_globals.accept_timeout_sec = 0;
+	if (mod_nats_globals.accept_timeout_sec > 86400) mod_nats_globals.accept_timeout_sec = 86400;
+
+	if (reload) {
+		int conn_changed = strcmp(mod_nats_globals.urls, urls_save) ||
+			strcmp(mod_nats_globals.subject_prefix, prefix_save) ||
+			strcmp(mod_nats_globals.node_uuid, node_save) ||
+			mod_nats_globals.workers != workers_save ||
+			mod_nats_globals.pub_qlen != pub_save ||
+			mod_nats_globals.req_qlen != req_save ||
+			!same_cstr(mod_nats_globals.user, user_save) ||
+			!same_cstr(mod_nats_globals.password, pass_save) ||
+			!same_cstr(mod_nats_globals.credentials, cred_save);
+
+		if (conn_changed) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+							  MOD_NATS_NAME " reload keeps the live connection, prefix, node-uuid and pool sizes; restart the module to apply those\n");
+			switch_copy_string(mod_nats_globals.urls, urls_save, sizeof(mod_nats_globals.urls));
+			switch_copy_string(mod_nats_globals.subject_prefix, prefix_save, sizeof(mod_nats_globals.subject_prefix));
+			switch_copy_string(mod_nats_globals.node_uuid, node_save, sizeof(mod_nats_globals.node_uuid));
+			mod_nats_globals.workers = workers_save;
+			mod_nats_globals.pub_qlen = pub_save;
+			mod_nats_globals.req_qlen = req_save;
+			switch_safe_free(mod_nats_globals.user);
+			switch_safe_free(mod_nats_globals.password);
+			switch_safe_free(mod_nats_globals.credentials);
+			mod_nats_globals.user = user_save;
+			mod_nats_globals.password = pass_save;
+			mod_nats_globals.credentials = cred_save;
+			user_save = pass_save = cred_save = NULL;
+		}
+		switch_safe_free(user_save);
+		switch_safe_free(pass_save);
+		switch_safe_free(cred_save);
+	}
 
 	return SWITCH_STATUS_SUCCESS;
 }
@@ -136,7 +232,11 @@ switch_status_t mod_nats_config_reload(void)
 	switch_status_t st = config_load(SWITCH_TRUE);
 
 	if (st == SWITCH_STATUS_SUCCESS) {
+		mod_nats_events_rebind();
 		mod_nats_js_ensure();
+		if (mod_nats_globals.metrics_interval > 0 && !mod_nats_globals.metrics_thread) {
+			mod_nats_metrics_start();
+		}
 	}
 	return st;
 }
@@ -175,6 +275,8 @@ static switch_status_t api_status(switch_stream_handle_t *stream)
 						   mod_nats_globals.enable_events ? "on" : "off",
 						   mod_nats_globals.publish_native_events ? "on" : "off",
 						   mod_nats_globals.enable_cdr ? "on" : "off");
+	stream->write_function(stream, "native api    %s\n", mod_nats_globals.allow_native_api ? "on" : "off");
+	stream->write_function(stream, "accept timeout %ds\n", mod_nats_globals.accept_timeout_sec);
 	stream->write_function(stream, "uptime        %lus\n", (unsigned long) since);
 	stream->write_function(stream, "msgs in/out   %lu / %lu\n", (unsigned long) in, (unsigned long) out);
 	stream->write_function(stream, "events out    %lu\n", (unsigned long) ev);
@@ -183,6 +285,12 @@ static switch_status_t api_status(switch_stream_handle_t *stream)
 	stream->write_function(stream, "dial          workers=%d queued=%u\n",
 						   mod_nats_globals.dial_thread_count,
 						   mod_nats_globals.dial_queue ? switch_queue_size(mod_nats_globals.dial_queue) : 0);
+	stream->write_function(stream, "queues        pub=%u js=%u reply=%u event=%u req=%u\n",
+						   mod_nats_globals.pub_queue ? switch_queue_size(mod_nats_globals.pub_queue) : 0,
+						   mod_nats_globals.js_queue ? switch_queue_size(mod_nats_globals.js_queue) : 0,
+						   mod_nats_globals.reply_queue ? switch_queue_size(mod_nats_globals.reply_queue) : 0,
+						   mod_nats_globals.event_queue ? switch_queue_size(mod_nats_globals.event_queue) : 0,
+						   mod_nats_globals.req_queue ? switch_queue_size(mod_nats_globals.req_queue) : 0);
 	stream->write_function(stream, "sessions      %lu\n", (unsigned long) switch_core_session_count());
 	stream->write_function(stream, "======================================\n");
 	return SWITCH_STATUS_SUCCESS;
@@ -219,7 +327,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_nats_load)
 	mod_nats_globals.started = switch_time_now();
 	mod_nats_globals.enable_events = SWITCH_TRUE;
 	mod_nats_globals.enable_cdr = SWITCH_TRUE;
-	mod_nats_globals.accept_timeout_sec = 10;
+	mod_nats_globals.accept_timeout_sec = 0;
 	mod_nats_globals.compat_xcc = SWITCH_TRUE;
 	mod_nats_globals.event_routing = EVENT_ROUTE_BOTH;
 	switch_copy_string(mod_nats_globals.urls, "nats://127.0.0.1:4222", sizeof(mod_nats_globals.urls));
@@ -231,8 +339,12 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_nats_load)
 
 	switch_mutex_init(&mod_nats_globals.mutex, SWITCH_MUTEX_NESTED, pool);
 	switch_mutex_init(&mod_nats_globals.chan_mutex, SWITCH_MUTEX_NESTED, pool);
+	switch_mutex_init(&mod_nats_globals.cpu_mutex, SWITCH_MUTEX_NESTED, pool);
 	switch_core_hash_init(&mod_nats_globals.chan_hash);
 	switch_queue_create(&mod_nats_globals.pub_queue, mod_nats_globals.pub_qlen, pool);
+	switch_queue_create(&mod_nats_globals.js_queue, mod_nats_globals.pub_qlen, pool);
+	switch_queue_create(&mod_nats_globals.reply_queue, mod_nats_globals.req_qlen, pool);
+	switch_queue_create(&mod_nats_globals.event_queue, mod_nats_globals.pub_qlen, pool);
 	switch_queue_create(&mod_nats_globals.req_queue, mod_nats_globals.req_qlen, pool);
 	switch_queue_create(&mod_nats_globals.dial_queue, mod_nats_globals.req_qlen, pool);
 
@@ -242,6 +354,13 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_nats_load)
 
 	if ((status = mod_nats_conn_start()) != SWITCH_STATUS_SUCCESS) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, MOD_NATS_NAME " connection failed; module not loaded\n");
+		mod_nats_globals.running = SWITCH_FALSE;
+		switch_safe_free(mod_nats_globals.user);
+		switch_safe_free(mod_nats_globals.password);
+		switch_safe_free(mod_nats_globals.credentials);
+		switch_safe_free(mod_nats_globals.cdr_subject);
+		switch_safe_free(mod_nats_globals.channel_params);
+		switch_core_hash_destroy(&mod_nats_globals.chan_hash);
 		return SWITCH_STATUS_FALSE;
 	}
 
@@ -259,19 +378,21 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_nats_load)
 	if ((status = mod_nats_events_start()) != SWITCH_STATUS_SUCCESS) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, MOD_NATS_NAME " event bind failed\n");
 		mod_nats_globals.running = SWITCH_FALSE;
+		switch_scheduler_del_task_group(MOD_NATS_SCHED_GROUP);
 		switch_queue_interrupt_all(mod_nats_globals.req_queue);
 		for (i = 0; i < mod_nats_globals.req_thread_count; i++) {
 			switch_status_t join_status;
 			switch_thread_join(&join_status, mod_nats_globals.req_threads[i]);
 		}
 		mod_nats_methods_dial_stop();
-		mod_nats_globals.pub_stop = SWITCH_TRUE;
-		switch_queue_interrupt_all(mod_nats_globals.pub_queue);
-		if (mod_nats_globals.pub_thread) {
-			switch_status_t join_status;
-			switch_thread_join(&join_status, mod_nats_globals.pub_thread);
-		}
+		mod_nats_publishers_stop();
 		mod_nats_conn_stop();
+		switch_safe_free(mod_nats_globals.user);
+		switch_safe_free(mod_nats_globals.password);
+		switch_safe_free(mod_nats_globals.credentials);
+		switch_safe_free(mod_nats_globals.cdr_subject);
+		switch_safe_free(mod_nats_globals.channel_params);
+		switch_core_hash_destroy(&mod_nats_globals.chan_hash);
 		return SWITCH_STATUS_FALSE;
 	}
 
@@ -292,11 +413,12 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_nats_shutdown)
 	switch_status_t join_status;
 
 	mod_nats_globals.running = SWITCH_FALSE;
-	mod_nats_events_stop();
-	/* unbind only delists the binding; give in-flight event callbacks a
-	 * moment to return before we tear down the hashes/mutexes they touch */
-	mod_nats_metrics_stop();
+	switch_scheduler_del_task_group(MOD_NATS_SCHED_GROUP);
+	/* unbind first so new callbacks stop; in-flight ones finish during the sleep */
+	mod_nats_events_unbind();
 	switch_sleep(250000);
+	mod_nats_events_shutdown();
+	mod_nats_metrics_stop();
 	switch_queue_interrupt_all(mod_nats_globals.req_queue);
 	/* apr_thread_join dereferences retval unconditionally - never pass NULL */
 	for (i = 0; i < mod_nats_globals.req_thread_count; i++) {
@@ -304,11 +426,7 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_nats_shutdown)
 	}
 	/* dial threads may still be inside originate; they enqueue Event.Result before exiting */
 	mod_nats_methods_dial_stop();
-	mod_nats_globals.pub_stop = SWITCH_TRUE;
-	switch_queue_interrupt_all(mod_nats_globals.pub_queue);
-	if (mod_nats_globals.pub_thread) {
-		switch_thread_join(&join_status, mod_nats_globals.pub_thread);
-	}
+	mod_nats_publishers_stop();
 	/* connection last: all publisher threads have stopped by now.
 	 * NOTE: nats_Close() is a one-shot global library teardown and must NOT
 	 * run here - a reload re-initializes the library immediately after and

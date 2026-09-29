@@ -13,8 +13,9 @@
  *  - XNode.Dial outcomes are delivered to the controller mailbox directly
  *    as Event.Result (correlated by the original rpc id).
  *
- * The event handler runs on an FS core thread: it only serializes and
- * enqueues (bounded, non-blocking) - never does socket I/O here.
+ * The FS event callback copies only the headers a channel event needs, then
+ * enqueues. A serializer thread prints each document once and fans the string
+ * out. Native events (except LOG) are still fully duplicated.
  */
 #include "mod_nats.h"
 #include <ctype.h>
@@ -64,15 +65,26 @@ void mod_nats_event_fill_channel_params(switch_event_t *event, cJSON *params, co
 	/* channel var whitelist: global config + per-channel (Accept) overlay */
 	{
 		char per_ch[2048];
+		char global_csv[2048];
 		char merged[4096];
 		char *argv[96];
 		int argc, i;
 		char *list;
 
+		global_csv[0] = '\0';
+		if (mod_nats_globals.mutex) {
+			switch_mutex_lock(mod_nats_globals.mutex);
+		}
+		if (!zstr(mod_nats_globals.channel_params)) {
+			switch_copy_string(global_csv, mod_nats_globals.channel_params, sizeof(global_csv));
+		}
+		if (mod_nats_globals.mutex) {
+			switch_mutex_unlock(mod_nats_globals.mutex);
+		}
 		mod_nats_methods_channel_params_copy(uuid, per_ch, sizeof(per_ch));
 		snprintf(merged, sizeof(merged), "%s%s%s",
-				 switch_str_nil(mod_nats_globals.channel_params),
-				 (!zstr(mod_nats_globals.channel_params) && !zstr(per_ch)) ? "," : "",
+				 global_csv,
+				 (!zstr(global_csv) && !zstr(per_ch)) ? "," : "",
 				 switch_str_nil(per_ch));
 		if (!zstr(merged) && (list = strdup(merged)) != NULL) {
 			argc = switch_separate_string(list, ',', argv, (int) (sizeof(argv) / sizeof(argv[0])));
@@ -107,16 +119,17 @@ static void publish_notification(const char *subject, const char *method, cJSON 
 
 	payload = cJSON_PrintUnformatted(env);
 	if (payload) {
-		mod_nats_publish_enqueue(subject, NULL, payload);
+		if (mod_nats_publish_enqueue(subject, NULL, payload) == SWITCH_STATUS_SUCCESS) {
+			switch_mutex_lock(mod_nats_globals.mutex);
+			mod_nats_globals.events_out++;
+			switch_mutex_unlock(mod_nats_globals.mutex);
+		}
 		free(payload);
-		switch_mutex_lock(mod_nats_globals.mutex);
-		mod_nats_globals.events_out++;
-		switch_mutex_unlock(mod_nats_globals.mutex);
 	}
 	cJSON_Delete(env);
 }
 
-void mod_nats_events_send_result(const char *ctrl_uuid, const char *rpc_id, cJSON *result)
+void mod_nats_events_send_result(const char *ctrl_uuid, const char *rpc_id, int rpc_id_is_number, cJSON *result)
 {
 	cJSON *env;
 	char *payload;
@@ -129,43 +142,53 @@ void mod_nats_events_send_result(const char *ctrl_uuid, const char *rpc_id, cJSO
 	env = cJSON_CreateObject();
 	cJSON_AddStringToObject(env, "jsonrpc", "2.0");
 	if (!zstr(rpc_id)) {
-		cJSON_AddStringToObject(env, "id", rpc_id);
+		if (rpc_id_is_number) {
+			cJSON_AddNumberToObject(env, "id", atof(rpc_id));
+		} else {
+			cJSON_AddStringToObject(env, "id", rpc_id);
+		}
 	}
 	cJSON_AddStringToObject(env, "method", "Event.Result");
 	cJSON_AddItemToObject(env, "params", result);
 
 	payload = cJSON_PrintUnformatted(env);
 	if (payload) {
-		mod_nats_publish_enqueue(mod_nats_subject_ctrl(ctrl_uuid), NULL, payload);
+		/* Control result: reply queue, so a JetStream CDR ack cannot delay it. */
+		mod_nats_publish_enqueue_hdr(mod_nats_subject_ctrl(ctrl_uuid), NULL, payload, NULL);
 		free(payload);
 	}
 	cJSON_Delete(env);
 }
 
-static void publish_channel_copy(const char *subject, cJSON *params)
+static void publish_channel_fanout(cJSON *params, char subjects[][MOD_NATS_PREFIX_MAX + SWITCH_UUID_FORMATTED_LENGTH + 32], int nsub)
 {
-	cJSON *dup = cJSON_Duplicate(params, 1);
+	cJSON *env = cJSON_CreateObject();
+	char *payload;
+	int i;
 
-	if (dup) {
-		publish_notification(subject, "Event.Channel", dup);
+	cJSON_AddStringToObject(env, "jsonrpc", "2.0");
+	cJSON_AddStringToObject(env, "method", "Event.Channel");
+	cJSON_AddItemToObject(env, "params", params);
+
+	payload = cJSON_PrintUnformatted(env);
+	if (payload) {
+		for (i = 0; i < nsub; i++) {
+			if (mod_nats_publish_enqueue(subjects[i], NULL, payload) == SWITCH_STATUS_SUCCESS) {
+				switch_mutex_lock(mod_nats_globals.mutex);
+				mod_nats_globals.events_out++;
+				switch_mutex_unlock(mod_nats_globals.mutex);
+			}
+		}
+		free(payload);
 	}
+	cJSON_Delete(env);
 }
 
-/* one-shot: hang up an inbound channel nobody Accepted within the timeout */
-static void accept_timeout_task(switch_scheduler_task_t *task)
+static void copy_subject(char *dst, size_t dstlen, const char *src)
 {
-	char *uuid = (char *) task->cmd_arg;
-
-	if (!zstr(uuid) && !mod_nats_methods_channel_owned(uuid)) {
-		switch_core_session_t *s = switch_core_session_locate(uuid);
-		if (s) {
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
-							  MOD_NATS_NAME " accept timeout, hanging up %s", uuid);
-			switch_channel_hangup(switch_core_session_get_channel(s), SWITCH_CAUSE_NO_ANSWER);
-			switch_core_session_rwunlock(s);
-		}
+	if (dst && dstlen) {
+		switch_copy_string(dst, switch_str_nil(src), dstlen);
 	}
-	switch_safe_free(uuid);
 }
 
 static void handle_channel_event(switch_event_t *event)
@@ -173,6 +196,13 @@ static void handle_channel_event(switch_event_t *event)
 	state_map_t *sm;
 	const char *uuid = switch_event_get_header(event, "Unique-ID");
 	cJSON *params;
+	char owner[SWITCH_UUID_FORMATTED_LENGTH + 1];
+	char obs[MOD_NATS_MAX_OBSERVERS][SWITCH_UUID_FORMATTED_LENGTH + 1];
+	char subjects[MOD_NATS_MAX_OBSERVERS + 2][MOD_NATS_PREFIX_MAX + SWITCH_UUID_FORMATTED_LENGTH + 32];
+	int nobs;
+	int nsub = 0;
+	int i;
+	int route;
 
 	if (zstr(uuid)) {
 		return;
@@ -187,12 +217,10 @@ static void handle_channel_event(switch_event_t *event)
 		return;
 	}
 
-	if (event->event_id == SWITCH_EVENT_CHANNEL_CREATE && mod_nats_globals.accept_timeout_sec > 0) {
+	if (event->event_id == SWITCH_EVENT_CHANNEL_CREATE) {
 		const char *dir = switch_event_get_header(event, "Caller-Direction");
-		if (!zstr(dir) && !strcasecmp(dir, "inbound") && !mod_nats_methods_channel_owned(uuid)) {
-			time_t when = switch_epoch_time_now(NULL) + mod_nats_globals.accept_timeout_sec;
-			switch_scheduler_add_task(when, accept_timeout_task, "mod_nats_accept_timeout",
-									   uuid, 0, strdup(uuid), SSHF_NONE);
+		if (!zstr(dir) && !strcasecmp(dir, "inbound")) {
+			mod_nats_methods_arm_accept_timeout(uuid);
 		}
 	}
 
@@ -201,28 +229,26 @@ static void handle_channel_event(switch_event_t *event)
 	cJSON_AddStringToObject(params, "state", sm->xcc_state);
 	mod_nats_event_fill_channel_params(event, params, uuid);
 
-	{
-		char owner[SWITCH_UUID_FORMATTED_LENGTH + 1];
-		mod_nats_obs_t *aud = NULL;
-		mod_nats_obs_t *it;
-		int route = mod_nats_globals.event_routing;
-
-		mod_nats_methods_snapshot_audience(uuid, owner, sizeof(owner), &aud);
-		/* public subject: always, except mailbox mode once a channel is owned */
-		if (route != EVENT_ROUTE_MAILBOX || zstr(owner)) {
-			char subject[MOD_NATS_PREFIX_MAX + 64];
-			snprintf(subject, sizeof(subject), "%sevent.channel.%s", mod_nats_globals.subject_prefix, sm->xcc_state);
-			publish_channel_copy(subject, params);
+	route = mod_nats_globals.event_routing;
+	nobs = mod_nats_methods_copy_audience(uuid, owner, sizeof(owner), obs, MOD_NATS_MAX_OBSERVERS);
+	/* subject_ctrl uses a thread-local buffer; copy each subject before the next call. */
+	if (route != EVENT_ROUTE_MAILBOX || zstr(owner)) {
+		snprintf(subjects[nsub], sizeof(subjects[0]), "%sevent.channel.%s", mod_nats_globals.subject_prefix, sm->xcc_state);
+		nsub++;
+	}
+	if (route != EVENT_ROUTE_BROADCAST) {
+		if (!zstr(owner)) {
+			copy_subject(subjects[nsub], sizeof(subjects[0]), mod_nats_subject_ctrl(owner));
+			nsub++;
 		}
-		if (route != EVENT_ROUTE_BROADCAST) {
-			if (!zstr(owner)) {
-				publish_channel_copy(mod_nats_subject_ctrl(owner), params);
-			}
-			for (it = aud; it; it = it->next) {
-				publish_channel_copy(mod_nats_subject_ctrl(it->ctrl_uuid), params);
-			}
+		for (i = 0; i < nobs; i++) {
+			copy_subject(subjects[nsub], sizeof(subjects[0]), mod_nats_subject_ctrl(obs[i]));
+			nsub++;
 		}
-		mod_nats_obs_list_free(aud);
+	}
+	if (nsub) {
+		publish_channel_fanout(params, subjects, nsub);
+	} else {
 		cJSON_Delete(params);
 	}
 
@@ -304,12 +330,8 @@ static void handle_native_event(switch_event_t *event)
 	publish_notification(mod_nats_subject_event(lower), "Event.NativeEvent", params);
 }
 
-static void event_handler(switch_event_t *event)
+static void dispatch_event(switch_event_t *event)
 {
-	if (!mod_nats_globals.running || !mod_nats_globals.enable_events) {
-		return;
-	}
-
 	switch (event->event_id) {
 	case SWITCH_EVENT_CHANNEL_CREATE:
 	case SWITCH_EVENT_CHANNEL_PROGRESS:
@@ -334,6 +356,189 @@ static void event_handler(switch_event_t *event)
 		handle_native_event(event);
 		break;
 	}
+}
+
+/* FS event thread: copy the headers we will publish, then enqueue.
+ * LOG is dropped here so a publish failure cannot feed itself. */
+static int is_channel_event(switch_event_types_t id)
+{
+	switch (id) {
+	case SWITCH_EVENT_CHANNEL_CREATE:
+	case SWITCH_EVENT_CHANNEL_PROGRESS:
+	case SWITCH_EVENT_CHANNEL_PROGRESS_MEDIA:
+	case SWITCH_EVENT_CHANNEL_ANSWER:
+	case SWITCH_EVENT_CHANNEL_BRIDGE:
+	case SWITCH_EVENT_CHANNEL_UNBRIDGE:
+	case SWITCH_EVENT_CHANNEL_HANGUP_COMPLETE:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+static void copy_header(switch_event_t *dst, switch_event_t *src, const char *name)
+{
+	const char *val = switch_event_get_header(src, name);
+
+	if (!zstr(val)) {
+		switch_event_add_header_string(dst, SWITCH_STACK_BOTTOM, name, val);
+	}
+}
+
+static void copy_whitelist(switch_event_t *dst, switch_event_t *src, const char *csv)
+{
+	char *list;
+	char *argv[96];
+	int argc;
+	int i;
+
+	if (zstr(csv) || !(list = strdup(csv))) {
+		return;
+	}
+	argc = switch_separate_string(list, ',', argv, (int) (sizeof(argv) / sizeof(argv[0])));
+	for (i = 0; i < argc; i++) {
+		char header[256];
+
+		if (zstr(argv[i])) {
+			continue;
+		}
+		copy_header(dst, src, argv[i]);
+		snprintf(header, sizeof(header), "variable_%s", argv[i]);
+		copy_header(dst, src, header);
+	}
+	free(list);
+}
+
+static switch_event_t *slim_channel_event(switch_event_t *event)
+{
+	switch_event_t *dup = NULL;
+	char global_csv[2048];
+	char per_ch[2048];
+	const char *uuid;
+	int i;
+	static const char *cdr_keys[] = {
+		"variable_duration",
+		"variable_billsec",
+		"variable_start_stamp",
+		"variable_answer_stamp",
+		"variable_end_stamp",
+		NULL
+	};
+
+	if (switch_event_create(&dup, event->event_id) != SWITCH_STATUS_SUCCESS) {
+		return NULL;
+	}
+	for (i = 0; CHAN_FIELD[i][0]; i++) {
+		copy_header(dup, event, CHAN_FIELD[i][0]);
+	}
+	if (event->event_id == SWITCH_EVENT_CHANNEL_HANGUP_COMPLETE) {
+		for (i = 0; cdr_keys[i]; i++) {
+			copy_header(dup, event, cdr_keys[i]);
+		}
+	}
+	uuid = switch_event_get_header(event, "Unique-ID");
+	global_csv[0] = '\0';
+	if (mod_nats_globals.mutex) {
+		switch_mutex_lock(mod_nats_globals.mutex);
+		if (!zstr(mod_nats_globals.channel_params)) {
+			switch_copy_string(global_csv, mod_nats_globals.channel_params, sizeof(global_csv));
+		}
+		switch_mutex_unlock(mod_nats_globals.mutex);
+	}
+	per_ch[0] = '\0';
+	if (!zstr(uuid)) {
+		mod_nats_methods_channel_params_copy(uuid, per_ch, sizeof(per_ch));
+	}
+	copy_whitelist(dup, event, global_csv);
+	copy_whitelist(dup, event, per_ch);
+	return dup;
+}
+
+static void event_handler(switch_event_t *event)
+{
+	switch_event_t *dup = NULL;
+
+	if (!mod_nats_globals.running || !mod_nats_globals.enable_events || !event) {
+		return;
+	}
+	if (event->event_id == SWITCH_EVENT_LOG) {
+		return;
+	}
+	if (is_channel_event(event->event_id)) {
+		dup = slim_channel_event(event);
+	} else if (!mod_nats_globals.publish_native_events || switch_event_dup(&dup, event) != SWITCH_STATUS_SUCCESS) {
+		return;
+	}
+	if (!dup) {
+		return;
+	}
+	if (!mod_nats_globals.event_queue ||
+		switch_queue_trypush(mod_nats_globals.event_queue, dup) != SWITCH_STATUS_SUCCESS) {
+		switch_event_destroy(&dup);
+		switch_mutex_lock(mod_nats_globals.mutex);
+		mod_nats_globals.msgs_dropped++;
+		switch_mutex_unlock(mod_nats_globals.mutex);
+	}
+}
+
+static void *SWITCH_THREAD_FUNC event_thread(switch_thread_t *t, void *data)
+{
+	while (!mod_nats_globals.event_stop) {
+		void *pop = NULL;
+		switch_event_t *event;
+		switch_status_t st = switch_queue_pop_timeout(mod_nats_globals.event_queue, &pop, 200000);
+
+		event = (switch_event_t *) pop;
+		if (event) {
+			dispatch_event(event);
+			switch_event_destroy(&event);
+		}
+		if (mod_nats_globals.event_stop) {
+			break;
+		}
+		if (st != SWITCH_STATUS_SUCCESS) {
+			continue;
+		}
+	}
+
+	{
+		void *pop = NULL;
+		while (switch_queue_trypop(mod_nats_globals.event_queue, &pop) == SWITCH_STATUS_SUCCESS && pop) {
+			switch_event_t *event = (switch_event_t *) pop;
+			dispatch_event(event);
+			switch_event_destroy(&event);
+		}
+	}
+	return NULL;
+}
+
+static const switch_event_types_t MOD_NATS_CHANNEL_EVENTS[] = {
+	SWITCH_EVENT_CHANNEL_CREATE,
+	SWITCH_EVENT_CHANNEL_PROGRESS,
+	SWITCH_EVENT_CHANNEL_PROGRESS_MEDIA,
+	SWITCH_EVENT_CHANNEL_ANSWER,
+	SWITCH_EVENT_CHANNEL_BRIDGE,
+	SWITCH_EVENT_CHANNEL_UNBRIDGE,
+	SWITCH_EVENT_CHANNEL_HANGUP_COMPLETE
+};
+
+static switch_status_t bind_events(void)
+{
+	unsigned int i;
+
+	if (!mod_nats_globals.enable_events) {
+		return SWITCH_STATUS_SUCCESS;
+	}
+	if (mod_nats_globals.publish_native_events) {
+		return switch_event_bind(MOD_NATS_NAME, SWITCH_EVENT_ALL, SWITCH_EVENT_SUBCLASS_ANY, event_handler, NULL);
+	}
+	for (i = 0; i < (sizeof(MOD_NATS_CHANNEL_EVENTS) / sizeof(MOD_NATS_CHANNEL_EVENTS[0])); i++) {
+		if (switch_event_bind(MOD_NATS_NAME, MOD_NATS_CHANNEL_EVENTS[i], SWITCH_EVENT_SUBCLASS_ANY, event_handler, NULL) != SWITCH_STATUS_SUCCESS) {
+			switch_event_unbind_callback(event_handler);
+			return SWITCH_STATUS_GENERR;
+		}
+	}
+	return SWITCH_STATUS_SUCCESS;
 }
 
 /* metrics heartbeat: publishes JStatus-equivalent node status on
@@ -390,13 +595,57 @@ void mod_nats_events_publish_nodeup(void)
 
 switch_status_t mod_nats_events_start(void)
 {
-	if (switch_event_bind(MOD_NATS_NAME, SWITCH_EVENT_ALL, SWITCH_EVENT_SUBCLASS_ANY, event_handler, NULL) != SWITCH_STATUS_SUCCESS) {
+	switch_threadattr_t *thd_attr;
+	switch_status_t status;
+
+	if (!mod_nats_globals.event_queue) {
 		return SWITCH_STATUS_GENERR;
 	}
-	return SWITCH_STATUS_SUCCESS;
+	mod_nats_globals.event_stop = SWITCH_FALSE;
+	switch_threadattr_create(&thd_attr, mod_nats_globals.pool);
+	switch_threadattr_stacksize_set(thd_attr, SWITCH_THREAD_STACKSIZE);
+	status = switch_thread_create(&mod_nats_globals.event_thread, thd_attr, event_thread, NULL, mod_nats_globals.pool);
+	if (status != SWITCH_STATUS_SUCCESS) {
+		return status;
+	}
+	if ((status = bind_events()) != SWITCH_STATUS_SUCCESS) {
+		mod_nats_events_shutdown();
+	}
+	return status;
+}
+
+void mod_nats_events_unbind(void)
+{
+	switch_event_unbind_callback(event_handler);
+}
+
+void mod_nats_events_shutdown(void)
+{
+	switch_status_t st;
+
+	mod_nats_globals.event_stop = SWITCH_TRUE;
+	if (mod_nats_globals.event_queue) {
+		switch_queue_interrupt_all(mod_nats_globals.event_queue);
+	}
+	if (mod_nats_globals.event_thread) {
+		switch_thread_join(&st, mod_nats_globals.event_thread);
+		mod_nats_globals.event_thread = NULL;
+	}
 }
 
 void mod_nats_events_stop(void)
 {
-	switch_event_unbind_callback(event_handler);
+	mod_nats_events_unbind();
+	mod_nats_events_shutdown();
+}
+
+void mod_nats_events_rebind(void)
+{
+	mod_nats_events_unbind();
+	if (!mod_nats_globals.running) {
+		return;
+	}
+	if (bind_events() != SWITCH_STATUS_SUCCESS) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, MOD_NATS_NAME " event rebind failed\n");
+	}
 }

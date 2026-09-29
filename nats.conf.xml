@@ -23,6 +23,12 @@
     <param name="event-routing" value="both"/>
     <!-- forward all native FS events (off by default; careful on high-CPS nodes) -->
     <param name="publish-native-events" value="false"/>
+    <!-- hang up unaccepted inbound calls after N seconds; 0 disables -->
+    <param name="accept-timeout" value="0"/>
+    <!-- fs.native.api and fs.native.jsapi; keep false unless the bus is trusted -->
+    <param name="allow-native-api" value="false"/>
+    <!-- Event.Metrics period in seconds; 0 disables. Subject is {prefix}metrics -->
+    <param name="metrics-interval" value="0"/>
     <!-- extra channel variables to include in Event.Channel (comma separated) -->
     <param name="channel-params" value="hangup_cause,sip_from_user"/>
     <!-- dedicated CDR subject, default is {prefix}event.cdr -->
