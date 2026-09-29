@@ -2,6 +2,8 @@
 
 NATS 消息总线集成模块。为 FreeSWITCH 提供通用的呼叫控制面、通道事件与 CDR 发布：任意外部系统通过 NATS 上的 JSON-RPC 接入，媒体留在 FreeSWITCH，控制走总线。控制协议与 XSwitch XCC 兼容，官方 XCtrl 可以作为客户端接入，自研的 Java、Go 或其他语言客户端按同一套主题和方法接入。
 
+控制面的思路来自 XSwitch 的开源项目 [XCtrl](https://github.com/xswitch-cn/xctrl) 和 [XCC 协议](https://docs.xswitch.cn/xcc-api/design/)。致谢见 [第 11 节](#11-致谢)。
+
 ## 1. 架构
 
 ```
@@ -304,7 +306,7 @@ nats stream add FS_METRICS --subjects 'nats.fs.metrics' --storage file --default
 1. **持久化**：`js-cdr` / `js-metrics` 打开后，CDR 和 metrics 走独立线程上的 JetStream 同步发布；流由 nats-server 配置，模块不创建 stream。通道事件保持 core NATS，由另一条线程发出，不等 ack。应答再走一条线程，核心线程只入队。
 2. **背压策略**：通道事件、JetStream、应答、请求、事件复制五条有界队列，满则丢弃并计数（`nats status` 可观测），绝不阻塞 FS core 线程。订阅还有 4096 条 / 8 MiB 的 pending 上限。断线时发布线程握住当前这一条并等待重连，不会把队列清掉。RPC 应答和 Event.Result 不等 JetStream ack。每条通道事件只序列化一次，再按受众扇出。
 3. **角色**：`fs.channel.accept` 取得控制权；未 Accept 的通道拒绝控制。`fs.channel.observe` 只收信箱事件。`event-routing` 决定公共主题和信箱是否同时发。默认 `both`。`DESTROY` 在注销绑定之前发出。Accept 超时默认关闭。
-4. **同名避让**：刻意不叫 mod_xcc（XSwitch 官方闭源模块名），协议兼容但实现独立，无 license 争议（协议定义 MIT/Apache 开源）。
+4. **同名避让**：刻意不叫 mod_xcc（XSwitch 官方闭源模块名）。思路来自公开的 XCtrl / XCC，实现是独立的，见 [第 11 节](#11-致谢)。
 5. **ESL 保持不动**：mod_event_socket 保留为运维通道（fs_cli），不参与新集成。
 
 ## 10. 已知限制
@@ -315,3 +317,9 @@ nats stream add FS_METRICS --subjects 'nats.fs.metrics' --storage file --default
 - 需要 libnats >= 3.0 才能编译。Windows 工程（.vcxproj）未创建。
 - `nats reload` 会重绑事件订阅并应用运行期开关。连接 URL、前缀、node-uuid、账号和队列长度保持加载时的值，要改这些需要重启模块。JetStream 上下文一旦绑上就不会拆。
 - 通道事件在独立线程里序列化，只复制白名单头部。`publish-native-events` 关闭时只绑定通道状态事件，不再订阅 `SWITCH_EVENT_ALL`。打开后仍丢弃 `SWITCH_EVENT_LOG`，避免日志回流。`XNode.NativeApp` 返回 200 表示应用已排队，不表示应用已经结束。
+
+## 11. 致谢
+
+呼叫控制面的思路来自 XSwitch 的开源控制器 [XCtrl](https://github.com/xswitch-cn/xctrl)，以及它使用的 [XCC 协议](https://docs.xswitch.cn/xcc-api/design/)（消息结构见 [xswitch-cn/proto](https://github.com/xswitch-cn/proto) 的 `xctrl.proto`）。Accept 接管、控制器信箱、通道状态事件，还有 `XNode.*` 这组 JSON-RPC 方法，都是顺着这套设计来的。感谢 XSwitch 团队把协议和 SDK 公开出来。
+
+本仓库是独立编写的通用 FreeSWITCH 模块，默认主题前缀是 `nats.fs.`。任何能收发 NATS 消息的程序都可以做控制器。官方 XCtrl SDK 按 [第 2 节](#2-subject-布局) 的方式接入。
