@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://freeswitch.org/mod_nats/schema/catalog.json",
   "title": "mod_nats wire catalog",
-  "description": "JSON-RPC 2.0 methods and events for mod_nats protocol 2.0.0. Canonical names are fs.*; XNode.* aliases are accepted when compat-xcc is on. Requests go to {prefix}node.{node_uuid}. Owner and observer events go to {prefix}ctrl.{ctrl_uuid}.",
+  "description": "JSON-RPC 2.0 methods and events for mod_nats protocol 2.1.0. Canonical names are fs.*; XNode.* aliases are accepted when compat-xcc is on. Requests go to {prefix}node.{node_uuid}. Owner and observer events go to {prefix}ctrl.{ctrl_uuid}.",
   "type": "object",
   "$defs": {
     "rpcId": {
@@ -73,6 +73,10 @@
       "allOf": [{ "$ref": "#/$defs/channelRef" }]
     },
     "fs.channel.unobserve": {
+      "allOf": [{ "$ref": "#/$defs/channelRef" }]
+    },
+    "fs.channel.touch": {
+      "description": "Renew the ownership lease without any other action. Every successful owner request renews implicitly; touch exists for controllers that only listen between calls. Result carries lease_ttl when a lease is armed (owner-lease-ttl > 0).",
       "allOf": [{ "$ref": "#/$defs/channelRef" }]
     },
     "fs.channel.answer": { "allOf": [{ "$ref": "#/$defs/channelRef" }] },
@@ -253,6 +257,17 @@
       "description": "Same object as the fs.node.hello result data field. Published on {prefix}event.nodeup at load.",
       "type": "object"
     },
+    "Event.OwnerLost": {
+      "description": "The owner lease elapsed and the channel is unclaimed again; a standby controller can re-Accept. Published on the old owner's mailbox and on {prefix}event.ownerlost.",
+      "type": "object",
+      "required": ["node_uuid", "uuid", "ctrl_uuid"],
+      "properties": {
+        "node_uuid": { "type": "string" },
+        "uuid": { "type": "string", "description": "Channel whose lease expired." },
+        "ctrl_uuid": { "type": "string", "description": "Controller that lost ownership." },
+        "timestamp": { "type": "integer", "description": "Epoch milliseconds." }
+      }
+    },
     "Event.Result": {
       "type": "object",
       "required": ["code", "message", "node_uuid", "job_uuid"],
@@ -271,7 +286,7 @@
       "properties": {
         "jsonrpc": { "const": "2.0" },
         "method": {
-          "enum": ["Event.Channel", "Event.CDR", "Event.Metrics", "Event.NodeUp", "Event.Result", "Event.NativeEvent"]
+          "enum": ["Event.Channel", "Event.CDR", "Event.Metrics", "Event.NodeUp", "Event.Result", "Event.NativeEvent", "Event.OwnerLost"]
         },
         "params": { "type": "object" },
         "id": { "$ref": "#/$defs/rpcId", "description": "Present on Event.Result when the dial request had an id." }

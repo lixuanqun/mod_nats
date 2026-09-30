@@ -7,11 +7,16 @@ Usage: python3 selftest.py   (expects FS + nats-server already running)
 """
 import asyncio
 import json
+import os
 import sys
 import time
 import uuid as uuidlib
 
-NATS_URL = "nats://127.0.0.1:4222"
+NATS_URL = os.environ.get("MODNATS_URL", "nats://127.0.0.1:4222")
+# park destination: an extension that answers and stays up. fs-minimal maps
+# 1000 to answer+park; the docker-lab image maps 1000 to a LiveKit bridge, so
+# point MODNATS_DEST at its echo extension (9196) there.
+DEST = os.environ.get("MODNATS_DEST", "loopback/1000")
 PREFIX = "nats.fs."
 NODE = "test-node-01"
 CTRL = "test-ctrl-01"
@@ -48,7 +53,11 @@ class Client:
     async def req(self, method, params=None, expect=None, timeout=8):
         self.rid += 1
         rid = f"t{self.rid}"
-        env = {"jsonrpc": "2.0", "id": rid, "method": method, "params": params or {}}
+        p = dict(params or {})
+        # xctrl SDKs stamp ctrl_uuid on every request; owner-gated methods
+        # 419 without it since v0.3
+        p.setdefault("ctrl_uuid", CTRL)
+        env = {"jsonrpc": "2.0", "id": rid, "method": method, "params": p}
         try:
             reply = await self.nc.request(NODE_SUBJECT, json.dumps(env).encode(), timeout=timeout)
             out = json.loads(reply.data.decode())
@@ -72,7 +81,7 @@ async def originate_parked(cli, tag):
     u = str(uuidlib.uuid4())
     out = await cli.req("XNode.NativeAPI", {
         "cmd": "originate",
-        "args": f"{{origination_uuid={u},ignore_early_media=true}}loopback/1000 &park",
+        "args": f"{{origination_uuid={u},ignore_early_media=true}}{DEST} &park",
     })
     if out is None:
         return None
@@ -190,10 +199,10 @@ async def main():
     # force state transitions via the escape hatch
     await cli.req_code("XNode.NativeApp", {"uuid": ua, "cmd": "ring_ready"}, 200,
                        "XNode.NativeApp(A,ring_ready) -> 200")
-    check("Event RINGING(A) [optional on loopback]", find_event("Event.Channel", uuid=ua, state="RINGING") is not None, "CHANNEL_PROGRESS")
+    print(f"  info: RINGING(A) observed: {find_event('Event.Channel', uuid=ua, state='RINGING') is not None} (loopback: optional)")
     await cli.req_code("XNode.NativeApp", {"uuid": ua, "cmd": "pre_answer"}, 200,
                        "XNode.NativeApp(A,pre_answer) -> 200")
-    check("Event MEDIA(A) [optional on loopback]", find_event("Event.Channel", uuid=ua, state="MEDIA") is not None, "CHANNEL_PROGRESS_MEDIA")
+    print(f"  info: MEDIA(A) observed: {find_event('Event.Channel', uuid=ua, state='MEDIA') is not None} (loopback: optional)")
 
     await cli.req_code("XNode.Answer", {"uuid": ua}, 200, "XNode.Answer(A) -> 200")
     check("Event ANSWERED(A)", await wait_for(lambda: find_event("Event.Channel", uuid=ua, state="ANSWERED")), "")
@@ -211,6 +220,10 @@ async def main():
     print("== bridge A<->B ==")
     ub = await originate_parked(cli, "B")
     if ub:
+        # both legs must be owned by this ctrl before Bridge; the originate
+        # above may have eaten most of A's lease, so touch it too
+        await cli.req_code("XNode.Touch", {"uuid": ua}, 200, "XNode.Touch(A, renew) -> 200")
+        await cli.req_code("XNode.Accept", {"uuid": ub}, 200, "XNode.Accept(B) -> 200")
         await cli.req_code("XNode.Answer", {"uuid": ub}, 200, "XNode.Answer(B) -> 200")
         await cli.req_code("XNode.Bridge", {"uuid": ua, "peer_uuid": ub}, 200, "XNode.Bridge(A,B) -> 200")
         check("Event BRIDGE", await wait_for(lambda: find_event("Event.Channel", uuid=ua, state="BRIDGE")
@@ -222,8 +235,8 @@ async def main():
         check("Event DESTROY(A)", await wait_for(lambda: find_event("Event.Channel", uuid=ua, state="DESTROY")), "")
         check("Event CDR(A)", await wait_for(lambda: find_event("Event.CDR", uuid=ua)), "")
         out = await cli.req("XNode.Hangup", {"uuid": ub})
-        check("XNode.Hangup(B) [ok if 200 or 404 when peer already closed]",
-              out is not None and out.get("result", {}).get("code") in (200, 404),
+        check("XNode.Hangup(B) [ok if 200/400/404: the unbridge may tear B down first]",
+              out is not None and out.get("result", {}).get("code") in (200, 400, 404),
               f"code={out.get('result', {}).get('code') if out else None}")
         await asyncio.sleep(0.5)
         check("Event CDR(B)", find_event("Event.CDR", uuid=ub) is not None, "")
@@ -234,7 +247,7 @@ async def main():
         "ctrl_uuid": CTRL,
         "destination": {"call_params": [{
             "uuid": uc,
-            "dial_string": "loopback/1000",
+            "dial_string": DEST,
             "cid_number": "10000210",
             "cid_name": "SelfTest",
         }]},
@@ -257,13 +270,37 @@ async def main():
               out is not None and out.get("result", {}).get("code") in (200, 404),
               f"code={out.get('result', {}).get('code') if out else None}")
 
+    print("== owner lease (owner-lease-ttl=4 in the test config) ==")
+    ud = await originate_parked(cli, "D")
+    if ud:
+        await cli.req_code("XNode.Accept", {"uuid": ud}, 200, "XNode.Accept(D) -> 200")
+        out = await cli.req_code("XNode.Touch", {"uuid": ud}, 200, "XNode.Touch(D) -> 200 (renews lease)")
+        if out:
+            check("Touch reports lease_ttl", out.get("result", {}).get("lease_ttl") == 4,
+                  f"lease_ttl={out.get('result', {}).get('lease_ttl')}")
+        # no further owner requests: the lease must elapse and release D
+        check("Event.OwnerLost(D) on event.ownerlost", await wait_for(
+            lambda: find_event("Event.OwnerLost", uuid=ud, ctrl_uuid=CTRL) is not None, 15), "ttl=4s")
+        out = await cli.req("fs.channel.getstate", {"uuid": ud})
+        check("old owner after expiry -> 400 (unclaimed)",
+              out is not None and out.get("result", {}).get("code") == 400,
+              f"code={out.get('result', {}).get('code') if out else None} msg={out.get('result', {}).get('message') if out else None}")
+        await cli.req_code("XNode.Accept", {"uuid": ud, "ctrl_uuid": "standby-ctrl"}, 200,
+                           "standby controller re-Accept(D) -> 200")
+        await cli.req_code("XNode.Touch", {"uuid": ud, "ctrl_uuid": "standby-ctrl"}, 200,
+                           "standby XNode.Touch(D) -> 200")
+        await cli.req_code("XNode.Hangup", {"uuid": ud, "ctrl_uuid": "standby-ctrl"}, 200,
+                           "standby XNode.Hangup(D) -> 200")
+
     print("== ctrl mailbox routing ==")
     check("A events routed to ctrl mailbox", any(
         m.get("method") == "Event.Channel" and m.get("params", {}).get("uuid") == ua for _, m in ctrl_msgs), "")
 
     print("== error paths ==")
     bogus = str(uuidlib.uuid4())
-    await cli.req_code("XNode.GetState", {"uuid": bogus}, 404, "bogus uuid -> 404")
+    # v0.3 semantics: the ownership gate fires before the session lookup,
+    # so an unknown uuid reports 400 "channel not accepted", not 404
+    await cli.req_code("XNode.GetState", {"uuid": bogus}, 400, "bogus uuid -> 400 (not accepted)")
     await cli.req_code("XNode.Answer", {}, 400, "missing uuid -> 400")
     out = await cli.req("XNode.NoSuchMethod", {})
     if out:

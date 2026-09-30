@@ -114,6 +114,7 @@ NATS 消息总线集成模块。为 FreeSWITCH 提供通用的呼叫控制面、
 | `Event.CDR` | `{prefix}event.cdr`（可用 `cdr-subject` 改） | `enable-cdr=true` 时，挂机完成。`js-cdr=true` 且流存在时走 JetStream |
 | `Event.Metrics` | `{prefix}metrics` | 配置了 `metrics-interval`（秒，大于 0）之后按该间隔发送。`js-metrics=true` 时走 JetStream |
 | `Event.Result` | `{prefix}ctrl.{ctrl_uuid}` | `XNode.Dial` 的异步结果，带原来的 JSON-RPC `id`。不走 JetStream |
+| `Event.OwnerLost` | `{prefix}event.ownerlost`，以及原 owner 的 `{prefix}ctrl.{ctrl_uuid}` | `owner-lease-ttl > 0` 且 owner 连续 N 秒没有任何成功控制请求/touch：释放通道，备用控制器可重新 Accept |
 | `Event.NativeEvent` | `{prefix}event.{事件名小写}` | 仅 `publish-native-events=true`。`SWITCH_EVENT_LOG` 一律丢弃 |
 
 `Event.Channel` 的 `params.state` 与 FreeSWITCH 事件的对应关系：
@@ -151,6 +152,7 @@ nats sub 'nats.fs.ctrl.>'       # 信箱：通道事件与 Event.Result
 | `fs.channel.accept` | `XNode.Accept` | 否（本方法取得控制权） |
 | `fs.channel.observe` | — | 否 |
 | `fs.channel.unobserve` | — | 否 |
+| `fs.channel.touch` | `XNode.Touch` | 是（续租，不做其他事） |
 | `fs.channel.dial` | `XNode.Dial` | 否（成功后该 uuid 归 `ctrl_uuid`） |
 | `fs.channel.answer` | `XNode.Answer` | 是 |
 | `fs.channel.hangup` | `XNode.Hangup` | 是 |
@@ -188,11 +190,12 @@ nats sub 'nats.fs.ctrl.>'       # 信箱：通道事件与 Event.Result
 
 result.code 语义：200 成功 / 202 已受理（结果走 Event.Result）/ 400 拒绝 / 404 通道不存在 / 419 已被其他控制器接管 / 500 内部错误 / 501 未实现。
 
-### 已实现方法（v0.1）
+### 已实现方法（v0.4）
 
 | 方法 | 说明 |
 |------|------|
-| XNode.Accept | 控制器接管通道（首个成功者获得控制权，后续返回 419） |
+| XNode.Accept | 控制器接管通道（首个成功者获得控制权，其他 ctrl 返回 419；同一 ctrl 重复 Accept 幂等返回 200 并续租） |
+| XNode.Touch / fs.channel.touch | 显式续租。响应带 `lease_ttl`（租约开启时） |
 | fs.channel.observe / unobserve | 观察者：不获得控制权。`event-routing` 为 `mailbox` 或 `both` 时，事件进入该 ctrl 信箱。每通道最多 32 个 |
 | XNode.Answer / Hangup | 应答 / 挂机。必须先 Accept；非 owner 返回 419 |
 | XNode.Play / Stop / Broadcast | 放音 / 停止放音 / 广播媒体 |
@@ -201,7 +204,9 @@ result.code 语义：200 成功 / 202 已受理（结果走 Event.Result）/ 400
 | XNode.Dial | 外呼（bgapi originate，立即回 202 + job_uuid，结果走 Event.Result） |
 | XNode.JStatus | 节点状态：sessions/peak/sps/uptime/version |
 | XNode.NativeApp / NativeAPI / NativeJSAPI | NativeApp 需 owner，把 `cmd::args` 排进会话线程后立即返回，不等应用跑完。NativeAPI / NativeJSAPI 默认关闭，见 `allow-native-api` |
-| Event.Channel / Event.CDR / Event.Result | 事件与异步结果 |
+| Event.Channel / Event.CDR / Event.Result / Event.OwnerLost | 事件与异步结果 |
+
+**所有权租约**（`owner-lease-ttl > 0` 时启用）：Accept/Dial 成功即起租；此后每一个成功的 owner 控制请求（含 `fs.channel.touch`）都会把租约顺延一个 ttl。连续 N 秒没有任何 owner 活动，通道绑定被释放并广播 `Event.OwnerLost`（原 owner 信箱 + `event.ownerlost` 公共主题），备用控制器可重新 Accept。外呼尚未 ringing 完成的 uuid（session 还不存在）不会被释放，租约顺延。建议 ttl 大于最长的 Dial 超时。owner 掉线后通道保持运行不受影响，只是控制权回到可接管状态——这是"controller 死了通道还能救"的兜底。
 
 **未实现（规划中）**：UnBridge2、Transfer、Hold、ThreeWay、Mute、ReadDTMF、DetectSpeech（ASR，可对接 mod_ws_audio）、Record、Conference 系列、MediaFork。NativeApp 在通道已被 Accept 后仍可把 dialplan app 排进该通道的会话线程。
 
@@ -237,6 +242,8 @@ result.code 语义：200 成功 / 202 已受理（结果走 Event.Result）/ 400
     <param name="publish-native-events" value="false"/>
     <!-- 未 Accept 的入向呼叫超时挂机，0 关闭（默认）。打开后任务挂在 mod_nats 这个 scheduler group 上 -->
     <param name="accept-timeout" value="0"/>
+    <!-- 所有权租约：owner 连续 N 秒没有成功控制请求/touch 就释放通道并广播 Event.OwnerLost，0 关闭（默认）。建议大于最长的 Dial 超时 -->
+    <param name="owner-lease-ttl" value="0"/>
     <!-- fs.native.api / fs.native.jsapi。默认关 -->
     <param name="allow-native-api" value="false"/>
     <!-- 事件附加通道变量白名单（逗号分隔） -->
@@ -305,13 +312,15 @@ nats stream add FS_METRICS --subjects 'nats.fs.metrics' --storage file --default
 
 1. **持久化**：`js-cdr` / `js-metrics` 打开后，CDR 和 metrics 走独立线程上的 JetStream 同步发布；流由 nats-server 配置，模块不创建 stream。通道事件保持 core NATS，由另一条线程发出，不等 ack。应答再走一条线程，核心线程只入队。
 2. **背压策略**：通道事件、JetStream、应答、请求、事件复制五条有界队列，满则丢弃并计数（`nats status` 可观测），绝不阻塞 FS core 线程。订阅还有 4096 条 / 8 MiB 的 pending 上限。断线时发布线程握住当前这一条并等待重连，不会把队列清掉。RPC 应答和 Event.Result 不等 JetStream ack。每条通道事件只序列化一次，再按受众扇出。
-3. **角色**：`fs.channel.accept` 取得控制权；未 Accept 的通道拒绝控制。`fs.channel.observe` 只收信箱事件。`event-routing` 决定公共主题和信箱是否同时发。默认 `both`。`DESTROY` 在注销绑定之前发出。Accept 超时默认关闭。
-4. **同名避让**：刻意不叫 mod_xcc（XSwitch 官方闭源模块名）。思路来自公开的 XCtrl / XCC，实现是独立的，见 [第 11 节](#11-致谢)。
-5. **ESL 保持不动**：mod_event_socket 保留为运维通道（fs_cli），不参与新集成。
+3. **角色**：`fs.channel.accept` 取得控制权；未 Accept 的通道拒绝控制。同一 ctrl 重复 Accept 幂等。`fs.channel.observe` 只收信箱事件。`event-routing` 决定公共主题和信箱是否同时发。默认 `both`。`DESTROY` 在注销绑定之前发出。Accept 超时默认关闭。
+4. **所有权租约**：`owner-lease-ttl` 秒内没有任何成功 owner 请求，绑定释放并广播 `Event.OwnerLost`，备用控制器可重新 Accept——这是 owner 进程死亡后的接管路径。租约的 scheduler 任务复用 accept-timeout 的模式（同 group、每 armed 租约恰好一个 task，续租只顺延 deadline 不加任务）。还在 originate 里的外呼预留（session 不存在）不释放，只顺延。租约默认关闭。
+5. **同名避让**：刻意不叫 mod_xcc（XSwitch 官方闭源模块名）。思路来自公开的 XCtrl / XCC，实现是独立的，见 [第 11 节](#11-致谢)。
+6. **ESL 保持不动**：mod_event_socket 保留为运维通道（fs_cli），不参与新集成。
 
 ## 10. 已知限制
 
 - `XNode.Dial` 立刻回 202。拨号在独立线程里进行，数量与 `workers` 相同，队列与 `req-qsize` 相同。队列满返回 503。结果仍是 ctrl 信箱上的 Event.Result。卸载时，已经在拨的呼叫会拨完；还排在队列里的回 480 shutting down。外呼前会占住 `origination_uuid`。
+- 租约到期只释放绑定并广播 `Event.OwnerLost`，不挂机、不改变通道状态。若 ttl 小于 Dial 时长，originate 期间可能发出一次多余的 OwnerLost，随后 Dial 完成时 owner 重新登记。把 ttl 配得比最长 Dial 超时大即可避免。
 - 未 Accept 的通道不能执行控制方法。`fs.native.api` / `fs.native.jsapi` 默认关闭。
 - `global_params` 会写成 originate 变量，但 `execute_on_*` / `api_on_*` / `api_hangup_hook` / `exec_after_*` 会被拒绝。
 - 需要 libnats >= 3.0 才能编译。Windows 工程（.vcxproj）未创建。

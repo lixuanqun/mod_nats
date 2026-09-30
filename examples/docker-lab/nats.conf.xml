@@ -11,6 +11,7 @@
     <param name="event-routing" value="both"/>
     <param name="publish-native-events" value="false"/>
     <param name="accept-timeout" value="0"/>
+    <param name="owner-lease-ttl" value="0"/>
     <param name="allow-native-api" value="false"/>
     <param name="channel-params" value=""/>
     <param name="cdr-subject" value=""/>

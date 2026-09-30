@@ -17,8 +17,9 @@
 #include <nats/nats.h>
 
 #define MOD_NATS_NAME "mod_nats"
-/* XCC wire protocol version implemented by this module */
-#define MOD_NATS_PROTO_VERSION "2.0.0"
+/* Wire protocol version implemented by this module. 2.1.0 adds the owner
+ * lease (fs.channel.touch / XNode.Touch, Event.OwnerLost). */
+#define MOD_NATS_PROTO_VERSION "2.1.0"
 
 #define MOD_NATS_PREFIX_MAX 64
 #define MOD_NATS_URLS_MAX 1024
@@ -84,6 +85,8 @@ typedef struct mod_nats_chan_s {
 	char *params_csv;				/* per-channel channel_params whitelist */
 	mod_nats_obs_t *observers;
 	uint32_t accept_task_id;		/* scheduler id, 0 when no accept-timeout is armed */
+	uint32_t lease_task_id;			/* scheduler id, 0 when no lease check is pending */
+	switch_time_t lease_deadline;	/* 0 when no lease is armed (owner-lease-ttl=0) */
 } mod_nats_chan_t;
 
 struct mod_nats_globals_s {
@@ -117,6 +120,7 @@ struct mod_nats_globals_s {
 	switch_mutex_t *chan_mutex;
 	switch_hash_t *chan_hash;		/* uuid -> mod_nats_chan_t */
 	int accept_timeout_sec;		/* unclaimed inbound hangup timer, 0=off */
+	int owner_lease_sec;		/* ownership expires after this much owner silence, 0=off */
 	enum {
 		EVENT_ROUTE_BROADCAST = 0,	/* public {prefix}event.channel.* only */
 		EVENT_ROUTE_MAILBOX = 1,	/* owner + observer mailboxes; unclaimed stays public */
@@ -215,6 +219,8 @@ void mod_nats_events_shutdown(void);
 void mod_nats_events_stop(void);
 void mod_nats_events_rebind(void);
 void mod_nats_events_send_result(const char *ctrl_uuid, const char *rpc_id, int rpc_id_is_number, cJSON *result);
+/* Lease expiry announcement: old owner mailbox + public event.ownerlost. */
+void mod_nats_events_publish_ownerlost(const char *uuid, const char *ctrl_uuid);
 void mod_nats_event_fill_channel_params(switch_event_t *event, cJSON *params, const char *uuid);
 
 /* mod_nats.c */

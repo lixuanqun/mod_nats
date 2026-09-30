@@ -27,6 +27,18 @@ static void chan_cancel_accept_task(mod_nats_chan_t *chan)
 	switch_scheduler_del_task_id(task_id);
 }
 
+static void chan_cancel_lease_task(mod_nats_chan_t *chan)
+{
+	uint32_t task_id;
+
+	if (!chan || !chan->lease_task_id) {
+		return;
+	}
+	task_id = chan->lease_task_id;
+	chan->lease_task_id = 0;
+	switch_scheduler_del_task_id(task_id);
+}
+
 static void chan_free(void *ptr)
 {
 	mod_nats_chan_t *chan = (mod_nats_chan_t *) ptr;
@@ -36,6 +48,7 @@ static void chan_free(void *ptr)
 		return;
 	}
 	chan_cancel_accept_task(chan);
+	chan_cancel_lease_task(chan);
 	while (chan->observers) {
 		obs = chan->observers;
 		chan->observers = obs->next;
@@ -75,6 +88,149 @@ static mod_nats_chan_t *chan_create(const char *uuid)
 	return chan;
 }
 
+/* ---------------------------------------------------------------------- */
+/* owner lease: ownership expires after owner-lease-ttl seconds without   */
+/* a successful owner request or an explicit fs.channel.touch. Expiry     */
+/* releases the binding (standby controllers can re-Accept) and announces */
+/* Event.OwnerLost. Exactly one scheduler task exists per armed lease:    */
+/* arming only moves the deadline while a task is pending, and the task   */
+/* itself zeroes lease_task_id before deciding to follow, push or expire. */
+
+static void lease_rearm_locked(mod_nats_chan_t *chan);
+static void lease_push(const char *uuid);
+static void lease_expire(const char *uuid);
+
+/* Scheduler callback at the armed deadline. */
+static void lease_timeout_task(switch_scheduler_task_t *task)
+{
+	const char *uuid = (const char *) task->cmd_arg;
+	switch_core_session_t *session;
+	switch_bool_t elapsed = SWITCH_FALSE;
+
+	if (!mod_nats_globals.running || zstr(uuid)) {
+		return;
+	}
+
+	switch_mutex_lock(mod_nats_globals.chan_mutex);
+	{
+		mod_nats_chan_t *chan = (mod_nats_chan_t *) switch_core_hash_find(mod_nats_globals.chan_hash, uuid);
+		if (chan) {
+			chan->lease_task_id = 0;
+			if (!zstr(chan->ctrl_uuid)) {
+				if (chan->lease_deadline > switch_time_now()) {
+					lease_rearm_locked(chan);	/* renewed meanwhile: follow the new deadline */
+				} else if (chan->lease_deadline) {
+					elapsed = SWITCH_TRUE;
+				}
+			}
+		}
+	}
+	switch_mutex_unlock(mod_nats_globals.chan_mutex);
+
+	if (!elapsed) {
+		return;
+	}
+
+	/* A uuid with no session yet is a dial reservation still inside
+	 * originate: keep the reservation, push the deadline out instead. */
+	session = switch_core_session_locate(uuid);
+	if (!session) {
+		lease_push(uuid);
+		return;
+	}
+	switch_core_session_rwunlock(session);
+	lease_expire(uuid);
+}
+
+/* Schedule the expiry check at chan->lease_deadline. Caller holds chan_mutex. */
+static void lease_rearm_locked(mod_nats_chan_t *chan)
+{
+	time_t when;
+	char *arg;
+	uint32_t task_id;
+
+	arg = strdup(chan->uuid);
+	if (!arg) {
+		chan->lease_deadline = 0;
+		return;
+	}
+	when = (time_t) (chan->lease_deadline / 1000000);
+	task_id = switch_scheduler_add_task(when, lease_timeout_task, "mod_nats_owner_lease",
+										 MOD_NATS_SCHED_GROUP, 0, arg, SSHF_FREE_ARG);
+	if (!task_id) {
+		free(arg);
+		chan->lease_deadline = 0;	/* cannot guard the deadline: disarm, never expire blindly */
+		return;
+	}
+	chan->lease_task_id = task_id;
+}
+
+/* Arm or extend the lease by one ttl. Caller holds chan_mutex. */
+static void lease_arm_locked(mod_nats_chan_t *chan)
+{
+	if (!chan || mod_nats_globals.owner_lease_sec <= 0) {
+		return;
+	}
+	chan->lease_deadline = switch_time_now() + (switch_time_t) mod_nats_globals.owner_lease_sec * 1000000;
+	if (!chan->lease_task_id) {
+		lease_rearm_locked(chan);
+	}
+}
+
+/* Push an elapsed lease one ttl out (dial reservation still originating). */
+static void lease_push(const char *uuid)
+{
+	mod_nats_chan_t *chan;
+
+	switch_mutex_lock(mod_nats_globals.chan_mutex);
+	chan = (mod_nats_chan_t *) switch_core_hash_find(mod_nats_globals.chan_hash, uuid);
+	if (chan && !zstr(chan->ctrl_uuid) && chan->lease_deadline && chan->lease_deadline <= switch_time_now()) {
+		chan->lease_deadline = switch_time_now() + (switch_time_t) mod_nats_globals.owner_lease_sec * 1000000;
+		lease_rearm_locked(chan);
+	}
+	switch_mutex_unlock(mod_nats_globals.chan_mutex);
+}
+
+/* Expire an elapsed lease: release the channel and announce Event.OwnerLost. */
+static void lease_expire(const char *uuid)
+{
+	mod_nats_chan_t *chan;
+	char owner[SWITCH_UUID_FORMATTED_LENGTH + 1] = "";
+
+	switch_mutex_lock(mod_nats_globals.chan_mutex);
+	chan = (mod_nats_chan_t *) switch_core_hash_find(mod_nats_globals.chan_hash, uuid);
+	if (chan && !zstr(chan->ctrl_uuid) && chan->lease_deadline && chan->lease_deadline <= switch_time_now()) {
+		switch_copy_string(owner, chan->ctrl_uuid, sizeof(owner));
+		chan->ctrl_uuid[0] = '\0';
+		chan->lease_deadline = 0;
+		chan->lease_task_id = 0;	/* this task is running: nothing to cancel */
+	}
+	switch_mutex_unlock(mod_nats_globals.chan_mutex);
+
+	if (!zstr(owner)) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
+						  MOD_NATS_NAME " owner lease expired, released %s (was ctrl %s)\n",
+						  uuid, owner);
+		mod_nats_events_publish_ownerlost(uuid, owner);
+	}
+}
+
+/* Every successful owner-gated request renews the lease. */
+static void lease_renew(const char *uuid)
+{
+	mod_nats_chan_t *chan;
+
+	if (zstr(uuid) || mod_nats_globals.owner_lease_sec <= 0) {
+		return;
+	}
+	switch_mutex_lock(mod_nats_globals.chan_mutex);
+	chan = (mod_nats_chan_t *) switch_core_hash_find(mod_nats_globals.chan_hash, uuid);
+	if (chan && !zstr(chan->ctrl_uuid)) {
+		lease_arm_locked(chan);
+	}
+	switch_mutex_unlock(mod_nats_globals.chan_mutex);
+}
+
 switch_status_t mod_nats_methods_register_channel(const char *uuid, const char *ctrl_uuid, const char *params_csv)
 {
 	mod_nats_chan_t *chan;
@@ -86,8 +242,15 @@ switch_status_t mod_nats_methods_register_channel(const char *uuid, const char *
 	switch_mutex_lock(mod_nats_globals.chan_mutex);
 	chan = (mod_nats_chan_t *) switch_core_hash_find(mod_nats_globals.chan_hash, uuid);
 	if (chan && !zstr(chan->ctrl_uuid)) {
+		if (strcmp(chan->ctrl_uuid, ctrl_uuid)) {
+			switch_mutex_unlock(mod_nats_globals.chan_mutex);
+			return SWITCH_STATUS_FALSE;	/* already owned: caller gets 419 */
+		}
+		/* same controller re-asserting (re-Accept, Dial completion):
+		 * idempotent success, refreshes the lease */
+		lease_arm_locked(chan);
 		switch_mutex_unlock(mod_nats_globals.chan_mutex);
-		return SWITCH_STATUS_FALSE;	/* already owned: caller gets 419 */
+		return SWITCH_STATUS_SUCCESS;
 	}
 	if (!chan && !(chan = chan_create(uuid))) {
 		switch_mutex_unlock(mod_nats_globals.chan_mutex);
@@ -96,6 +259,7 @@ switch_status_t mod_nats_methods_register_channel(const char *uuid, const char *
 	switch_copy_string(chan->ctrl_uuid, ctrl_uuid, sizeof(chan->ctrl_uuid));
 	obs_unlink(chan, ctrl_uuid);
 	chan_cancel_accept_task(chan);
+	lease_arm_locked(chan);
 	if (!zstr(params_csv)) {
 		switch_safe_free(chan->params_csv);
 		chan->params_csv = strdup(params_csv);
@@ -391,6 +555,7 @@ static switch_status_t require_owner_uuid(mod_nats_req_ctx_t *ctx, cJSON *extra,
 		}
 		return SWITCH_STATUS_FALSE;
 	}
+	lease_renew(uuid);
 	return SWITCH_STATUS_SUCCESS;
 }
 
@@ -1057,6 +1222,10 @@ static void dial_job_run(mod_nats_dial_job_t *job)
 				dial_job_free(job);
 				return;
 			}
+		} else if (mod_nats_methods_register_channel(uuid_b, job->ctrl_uuid, NULL) != SWITCH_STATUS_SUCCESS) {
+			/* lease elapsed mid-originate and another controller took the channel */
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+							  MOD_NATS_NAME " dial completed on %s but another controller owns it\n", uuid_b);
 		}
 		switch_ivr_park_session(bleg);
 		switch_core_session_rwunlock(bleg);
@@ -1367,6 +1536,22 @@ static switch_status_t mn_hello(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *e
 	return SWITCH_STATUS_SUCCESS;
 }
 
+/* fs.channel.touch: renew the lease without any other action. The renewal
+ * itself already happened in require_owner_uuid; this is the explicit form
+ * for controllers that only listen between calls. */
+static switch_status_t mn_touch(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *extra)
+{
+	switch_status_t own;
+
+	if ((own = require_owner(ctx, params, extra)) != SWITCH_STATUS_SUCCESS) {
+		return own;
+	}
+	if (extra && mod_nats_globals.owner_lease_sec > 0) {
+		cJSON_AddNumberToObject(extra, "lease_ttl", mod_nats_globals.owner_lease_sec);
+	}
+	return SWITCH_STATUS_SUCCESS;
+}
+
 /* Method table: canonical fs.* names with XCC aliases (xctrl SDK compat,
  * gated by the compat-xcc config). Keep names in sync with README. */
 const mod_nats_method_t mod_nats_methods[] = {
@@ -1374,6 +1559,7 @@ const mod_nats_method_t mod_nats_methods[] = {
 	{"fs.channel.accept", "XNode.Accept", mn_accept, SWITCH_TRUE},
 	{"fs.channel.observe", NULL, mn_observe, SWITCH_TRUE},
 	{"fs.channel.unobserve", NULL, mn_unobserve, SWITCH_TRUE},
+	{"fs.channel.touch", "XNode.Touch", mn_touch, SWITCH_TRUE},
 	{"fs.channel.answer", "XNode.Answer", mn_answer, SWITCH_TRUE},
 	{"fs.channel.hangup", "XNode.Hangup", mn_hangup, SWITCH_TRUE},
 	{"fs.channel.play", "XNode.Play", mn_play, SWITCH_TRUE},

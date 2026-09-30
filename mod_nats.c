@@ -148,6 +148,8 @@ static switch_status_t config_load(switch_bool_t reload)
 				mod_nats_globals.enable_cdr = switch_true(val);
 			} else if (!strcmp(name, "accept-timeout")) {
 				mod_nats_globals.accept_timeout_sec = atoi(val);
+			} else if (!strcmp(name, "owner-lease-ttl")) {
+				mod_nats_globals.owner_lease_sec = atoi(val);
 			} else if (!strcmp(name, "metrics-interval")) {
 				mod_nats_globals.metrics_interval = atoi(val);
 			} else if (!strcmp(name, "compat-xcc")) {
@@ -190,6 +192,8 @@ static switch_status_t config_load(switch_bool_t reload)
 	if (mod_nats_globals.metrics_interval > 3600) mod_nats_globals.metrics_interval = 3600;
 	if (mod_nats_globals.accept_timeout_sec < 0) mod_nats_globals.accept_timeout_sec = 0;
 	if (mod_nats_globals.accept_timeout_sec > 86400) mod_nats_globals.accept_timeout_sec = 86400;
+	if (mod_nats_globals.owner_lease_sec < 0) mod_nats_globals.owner_lease_sec = 0;
+	if (mod_nats_globals.owner_lease_sec > 86400) mod_nats_globals.owner_lease_sec = 86400;
 
 	if (reload) {
 		int conn_changed = strcmp(mod_nats_globals.urls, urls_save) ||
@@ -277,6 +281,7 @@ static switch_status_t api_status(switch_stream_handle_t *stream)
 						   mod_nats_globals.enable_cdr ? "on" : "off");
 	stream->write_function(stream, "native api    %s\n", mod_nats_globals.allow_native_api ? "on" : "off");
 	stream->write_function(stream, "accept timeout %ds\n", mod_nats_globals.accept_timeout_sec);
+	stream->write_function(stream, "owner lease   ttl=%ds\n", mod_nats_globals.owner_lease_sec);
 	stream->write_function(stream, "uptime        %lus\n", (unsigned long) since);
 	stream->write_function(stream, "msgs in/out   %lu / %lu\n", (unsigned long) in, (unsigned long) out);
 	stream->write_function(stream, "events out    %lu\n", (unsigned long) ev);

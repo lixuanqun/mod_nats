@@ -1,6 +1,25 @@
 # mod_nats 本地全链路与压测记录
 
-日期：2026-09-29。环境是本机 Docker，不是外部 SIP 中继。
+## 2026-09-30 v0.4.0：所有权租约全链路
+
+日期：2026-09-30。环境：`examples/docker-lab` compose（nats + fs + 消费端），fs 镜像由本仓库 Dockerfile.fs 从 `aicc-fs:local-verify` 构建，模块即本仓库源码。测试配置：`node-uuid=test-node-01`、`allow-native-api=true`（selftest 用 originate 建通道）、`owner-lease-ttl=4`、`metrics-interval=1`、`channel-params=hangup_cause,test_var`。呼叫路径 `loopback/9196 &park`（镜像 dialplan 的 echo 应答）。selftest 经 `MODNATS_URL` / `MODNATS_DEST` 环境变量指向 lab 网络。
+
+**60/60 通过**，其中租约专项：
+
+| 用例 | 结果 |
+|------|------|
+| Accept(D) 起租 | 200 |
+| `XNode.Touch` / `fs.channel.touch` | 200，result 带 `lease_ttl=4` |
+| owner 静默 4s 后 `Event.OwnerLost` | 在 `event.ownerlost` 公共主题与原 owner 信箱都收到 |
+| 到期后原 owner `GetState` | 400 `channel not accepted`（绑定已释放） |
+| 备用控制器重新 Accept | 200，取得控制权 |
+| 备用控制器 Touch / Hangup | 均 200 |
+| `nats status` | 新增 `owner lease ttl=Ns` 行 |
+| 3 × `reload mod_nats`（ttl=4 生效中） | 连接每次回到 UP，无崩溃 |
+
+同一轮里 Dial 的 202/job_uuid/`Event.Result` 链路、bridge、CDR、信箱路由全部通过。本轮同时修正了 selftest 相对 v0.3 语义的漂移：客户端默认注入 `ctrl_uuid`（与 xctrl SDK 一致）、未知 uuid 在所有权门禁下报 400 而非 404、RINGING/MEDIA 降级为提示信息。
+
+## 2026-09-29：v0.3.1 全链路与压测
 
 ## 环境
 

@@ -25,6 +25,11 @@
     <param name="publish-native-events" value="false"/>
     <!-- hang up unaccepted inbound calls after N seconds; 0 disables -->
     <param name="accept-timeout" value="0"/>
+    <!-- ownership lease: release a channel and publish Event.OwnerLost after
+         N seconds without a successful owner request or fs.channel.touch;
+         standby controllers can then re-Accept. 0 disables. Keep it larger
+         than your longest Dial timeout. -->
+    <param name="owner-lease-ttl" value="0"/>
     <!-- fs.native.api and fs.native.jsapi; keep false unless the bus is trusted -->
     <param name="allow-native-api" value="false"/>
     <!-- Event.Metrics period in seconds; 0 disables. Subject is {prefix}metrics -->

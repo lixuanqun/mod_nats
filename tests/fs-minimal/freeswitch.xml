@@ -44,6 +44,11 @@
         <param name="publish-native-events" value="false"/>
         <param name="channel-params" value="hangup_cause,test_var"/>
         <param name="metrics-interval" value="1"/>
+        <!-- selftest drives channels via originate, so native api stays on
+             here; production configs should leave it off -->
+        <param name="allow-native-api" value="true"/>
+        <!-- lease test: expire ownership after 4s of owner silence -->
+        <param name="owner-lease-ttl" value="4"/>
       </settings>
     </configuration>
   </section>

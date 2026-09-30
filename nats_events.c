@@ -160,6 +160,29 @@ void mod_nats_events_send_result(const char *ctrl_uuid, const char *rpc_id, int 
 	cJSON_Delete(env);
 }
 
+/* Event.OwnerLost: the owner lease elapsed and the channel is unclaimed
+ * again. Delivered to the old owner's mailbox and to event.ownerlost so a
+ * standby controller can re-Accept. */
+static cJSON *ownerlost_params(const char *uuid, const char *ctrl_uuid)
+{
+	cJSON *params = cJSON_CreateObject();
+
+	cJSON_AddStringToObject(params, "node_uuid", mod_nats_globals.node_uuid);
+	cJSON_AddStringToObject(params, "uuid", uuid);
+	cJSON_AddStringToObject(params, "ctrl_uuid", ctrl_uuid);
+	cJSON_AddNumberToObject(params, "timestamp", (double) (switch_time_now() / 1000));
+	return params;
+}
+
+void mod_nats_events_publish_ownerlost(const char *uuid, const char *ctrl_uuid)
+{
+	if (zstr(uuid) || zstr(ctrl_uuid)) {
+		return;
+	}
+	publish_notification(mod_nats_subject_ctrl(ctrl_uuid), "Event.OwnerLost", ownerlost_params(uuid, ctrl_uuid));
+	publish_notification(mod_nats_subject_event("ownerlost"), "Event.OwnerLost", ownerlost_params(uuid, ctrl_uuid));
+}
+
 static void publish_channel_fanout(cJSON *params, char subjects[][MOD_NATS_PREFIX_MAX + SWITCH_UUID_FORMATTED_LENGTH + 32], int nsub)
 {
 	cJSON *env = cJSON_CreateObject();
