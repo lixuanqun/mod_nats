@@ -217,6 +217,43 @@ async def main():
     await asyncio.sleep(0.5)
     await cli.req_code("XNode.Stop", {"uuid": ua}, 200, "XNode.Stop(A) after broadcast -> 200")
 
+    print("== DTMF detect + record ==")
+    # loopback send_dtmf lands on the PEER channel's queue, and SWITCH_EVENT_
+    # DTMF fires on dequeue - so run mod_dptools' read on the peer leg, then
+    # send digits from A. '#' terminates read immediately. The peer is the
+    # loopback's dialplan leg: A is the first channel of this run, so the
+    # only other START event at this point belongs to it (peer_uuid only
+    # appears on bridged channels).
+    peer = None
+    for _, msg in events:
+        p = msg.get("params", {})
+        if msg.get("method") == "Event.Channel" and p.get("state") == "START" and p.get("uuid") != ua:
+            peer = p.get("uuid")
+            break
+    check("A peer_uuid discovered", peer is not None, str(peer)[:12])
+    if peer:
+        await cli.req_code("XNode.Accept", {"uuid": peer}, 200, "XNode.Accept(peer) -> 200")
+        await cli.req_code("XNode.NativeApp", {"uuid": peer, "cmd": "read",
+                                                "args": "1 4 silence_stream://200 nats_digits 8000 #"}, 200,
+                           "XNode.NativeApp(peer,read) -> 200")
+        await asyncio.sleep(0.3)
+        await cli.req_code("XNode.NativeAPI", {"cmd": "uuid_send_dtmf", "args": f"{ua} 12#"}, 200,
+                           "uuid_send_dtmf(A,'12#') -> 200")
+        check("Event.Detected dtmf=1", await wait_for(
+            lambda: find_event("Event.Detected", uuid=peer, dtmf="1") is not None), "")
+        check("Event.Detected dtmf=2", await wait_for(
+            lambda: find_event("Event.Detected", uuid=peer, dtmf="2") is not None), "")
+        check("Event.Detected routed to ctrl mailbox", any(
+            m.get("method") == "Event.Detected" and m.get("params", {}).get("uuid") == peer for _, m in ctrl_msgs), "")
+    rec = "/tmp/modnats-selftest.wav"
+    await cli.req_code("XNode.Record", {"uuid": ua, "action": "RECORD", "file": rec}, 200,
+                       "XNode.Record(A,RECORD) -> 200")
+    await asyncio.sleep(1)
+    await cli.req_code("XNode.Record", {"uuid": ua, "action": "STOP", "file": rec}, 200,
+                       "XNode.Record(A,STOP) -> 200")
+    await cli.req_code("XNode.Record", {"uuid": ua, "action": "RECORD", "file": "/tmp/../etc/x.wav"}, 400,
+                       "XNode.Record path traversal -> 400")
+
     print("== bridge A<->B ==")
     ub = await originate_parked(cli, "B")
     if ub:

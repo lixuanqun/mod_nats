@@ -1,5 +1,20 @@
 # mod_nats 本地全链路与压测记录
 
+## 2026-10-01 v0.4.1：DTMF 转发与录音
+
+环境同 v0.4.0 一轮（docker-lab，`loopback/9001 &park`，test-node-01，租约 ttl=4）。**70/70 通过**，新增覆盖：
+
+| 用例 | 结果 |
+|------|------|
+| 对端腿 Accept + `read` 应用排队，A 腿 `uuid_send_dtmf '12#'` | `Event.Detected` type=dtmf 收到 `1`、`2` 两条，带 duration |
+| `Event.Detected` 路由 | owner 信箱与 `event.detected` 都收到 |
+| `XNode.Record` RECORD → 1s → STOP | 均 200，`/tmp/modnats-selftest.wav` 生成 |
+| 录音路径含 `..` | 400 拒绝 |
+
+DTMF 的两个环境事实（已写进 selftest 注释）：FS 核心的 `SWITCH_EVENT_DTMF` 在 `switch_channel_dequeue_dtmf` 消费时触发，park 住的通道不读按键就没有事件——测试用 mod_dptools 的 `read` 消费；mod_loopback 的 `send_dtmf` 把数字排到对端队列，所以 read 排在对端腿、数字从 A 腿注入。生产中真实的 SIP 话机按键同样由读 DTMF 的应用（read/play_and_get_digits/ASR）触发事件，行为一致。
+
+修正过程记录：`SWITCH_EVENT_CHANNEL_DTMF` 在 FS 头文件中不存在（首次构建失败被管道掩盖，以 capabilities 探测确认旧二进制后定位），正确事件是 `SWITCH_EVENT_DTMF`；构建日志改走文件避免 tail 吞错。
+
 ## 2026-09-30 v0.4.0：所有权租约全链路
 
 日期：2026-09-30。环境：`examples/docker-lab` compose（nats + fs + 消费端），fs 镜像由本仓库 Dockerfile.fs 从 `aicc-fs:local-verify` 构建，模块即本仓库源码。测试配置：`node-uuid=test-node-01`、`allow-native-api=true`（selftest 用 originate 建通道）、`owner-lease-ttl=4`、`metrics-interval=1`、`channel-params=hangup_cause,test_var`。呼叫路径 `loopback/9196 &park`（镜像 dialplan 的 echo 应答）。selftest 经 `MODNATS_URL` / `MODNATS_DEST` 环境变量指向 lab 网络。

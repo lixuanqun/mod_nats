@@ -17,9 +17,10 @@
 #include <nats/nats.h>
 
 #define MOD_NATS_NAME "mod_nats"
-/* Wire protocol version implemented by this module. 2.1.0 adds the owner
- * lease (fs.channel.touch / XNode.Touch, Event.OwnerLost). */
-#define MOD_NATS_PROTO_VERSION "2.1.0"
+/* Wire protocol version implemented by this module. 2.2.0 adds the owner
+ * lease (fs.channel.touch / XNode.Touch, Event.OwnerLost), fs.channel.record
+ * / XNode.Record and Event.Detected DTMF forwarding. */
+#define MOD_NATS_PROTO_VERSION "2.2.0"
 
 #define MOD_NATS_PREFIX_MAX 64
 #define MOD_NATS_URLS_MAX 1024

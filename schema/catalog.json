@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://freeswitch.org/mod_nats/schema/catalog.json",
   "title": "mod_nats wire catalog",
-  "description": "JSON-RPC 2.0 methods and events for mod_nats protocol 2.1.0. Canonical names are fs.*; XNode.* aliases are accepted when compat-xcc is on. Requests go to {prefix}node.{node_uuid}. Owner and observer events go to {prefix}ctrl.{ctrl_uuid}.",
+  "description": "JSON-RPC 2.0 methods and events for mod_nats protocol 2.2.0. Canonical names are fs.*; XNode.* aliases are accepted when compat-xcc is on. Requests go to {prefix}node.{node_uuid}. Owner and observer events go to {prefix}ctrl.{ctrl_uuid}.",
   "type": "object",
   "$defs": {
     "rpcId": {
@@ -98,6 +98,16 @@
           "required": ["file"],
           "properties": { "file": { "type": "string", "minLength": 1 } }
         }
+      }
+    },
+    "fs.channel.record": {
+      "description": "Start/stop a session recording (mirrors uuid_record). The file path is the recording key: STOP/PAUSE/MASK must repeat the same path. Paths containing '..' are rejected.",
+      "allOf": [{ "$ref": "#/$defs/channelRef" }],
+      "required": ["file"],
+      "properties": {
+        "action": { "type": "string", "enum": ["RECORD", "START", "STOP", "PAUSE", "RESUME", "MASK", "UNMASK"], "description": "Default RECORD." },
+        "file": { "type": "string", "minLength": 1 },
+        "limit": { "type": "integer", "minimum": 0, "description": "Max recording seconds, 0 unlimited." }
       }
     },
     "fs.channel.broadcast": {
@@ -268,6 +278,18 @@
         "timestamp": { "type": "integer", "description": "Epoch milliseconds." }
       }
     },
+    "Event.Detected": {
+      "description": "Detected input on a channel. DTMF digits arrive here (type=dtmf) on the owner/observer mailboxes and, per event-routing, {prefix}event.detected. This is the event-driven replacement for a blocking XNode.ReadDTMF.",
+      "type": "object",
+      "required": ["node_uuid", "uuid", "type", "dtmf"],
+      "properties": {
+        "node_uuid": { "type": "string" },
+        "uuid": { "type": "string" },
+        "type": { "const": "dtmf" },
+        "dtmf": { "type": "string", "description": "One digit (0-9,*,#,A-D)." },
+        "duration": { "type": "string", "description": "Digit duration in ms, when the platform reported it." }
+      }
+    },
     "Event.Result": {
       "type": "object",
       "required": ["code", "message", "node_uuid", "job_uuid"],
@@ -286,7 +308,7 @@
       "properties": {
         "jsonrpc": { "const": "2.0" },
         "method": {
-          "enum": ["Event.Channel", "Event.CDR", "Event.Metrics", "Event.NodeUp", "Event.Result", "Event.NativeEvent", "Event.OwnerLost"]
+          "enum": ["Event.Channel", "Event.CDR", "Event.Metrics", "Event.NodeUp", "Event.Result", "Event.NativeEvent", "Event.OwnerLost", "Event.Detected"]
         },
         "params": { "type": "object" },
         "id": { "$ref": "#/$defs/rpcId", "description": "Present on Event.Result when the dial request had an id." }

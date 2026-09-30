@@ -183,14 +183,16 @@ void mod_nats_events_publish_ownerlost(const char *uuid, const char *ctrl_uuid)
 	publish_notification(mod_nats_subject_event("ownerlost"), "Event.OwnerLost", ownerlost_params(uuid, ctrl_uuid));
 }
 
-static void publish_channel_fanout(cJSON *params, char subjects[][MOD_NATS_PREFIX_MAX + SWITCH_UUID_FORMATTED_LENGTH + 32], int nsub)
+/* Serialize one notification and fan the string out to every audience
+ * subject. Channel events and detected input share this path. */
+static void publish_fanout(const char *method, cJSON *params, char subjects[][MOD_NATS_PREFIX_MAX + SWITCH_UUID_FORMATTED_LENGTH + 32], int nsub)
 {
 	cJSON *env = cJSON_CreateObject();
 	char *payload;
 	int i;
 
 	cJSON_AddStringToObject(env, "jsonrpc", "2.0");
-	cJSON_AddStringToObject(env, "method", "Event.Channel");
+	cJSON_AddStringToObject(env, "method", method);
 	cJSON_AddItemToObject(env, "params", params);
 
 	payload = cJSON_PrintUnformatted(env);
@@ -270,13 +272,66 @@ static void handle_channel_event(switch_event_t *event)
 		}
 	}
 	if (nsub) {
-		publish_channel_fanout(params, subjects, nsub);
+		publish_fanout("Event.Channel", params, subjects, nsub);
 	} else {
 		cJSON_Delete(params);
 	}
 
 	if (event->event_id == SWITCH_EVENT_CHANNEL_HANGUP_COMPLETE) {
 		mod_nats_methods_unregister_channel(uuid);
+	}
+}
+
+/* DTMF arrives as Event.Detected on the owner/observer mailboxes and, per
+ * event-routing, the public event.detected subject. Unclaimed channels only
+ * publish publicly (same rule as channel events). */
+static void handle_dtmf_event(switch_event_t *event)
+{
+	const char *uuid = switch_event_get_header(event, "Unique-ID");
+	const char *digit = switch_event_get_header(event, "DTMF-Digit");
+	const char *duration = switch_event_get_header(event, "DTMF-Duration");
+	cJSON *params;
+	char owner[SWITCH_UUID_FORMATTED_LENGTH + 1];
+	char obs[MOD_NATS_MAX_OBSERVERS][SWITCH_UUID_FORMATTED_LENGTH + 1];
+	char subjects[MOD_NATS_MAX_OBSERVERS + 2][MOD_NATS_PREFIX_MAX + SWITCH_UUID_FORMATTED_LENGTH + 32];
+	int nobs;
+	int nsub = 0;
+	int i;
+	int route;
+
+	if (zstr(uuid) || zstr(digit)) {
+		return;
+	}
+
+	params = cJSON_CreateObject();
+	cJSON_AddStringToObject(params, "node_uuid", mod_nats_globals.node_uuid);
+	cJSON_AddStringToObject(params, "uuid", uuid);
+	cJSON_AddStringToObject(params, "type", "dtmf");
+	cJSON_AddStringToObject(params, "dtmf", digit);
+	if (!zstr(duration)) {
+		cJSON_AddStringToObject(params, "duration", duration);
+	}
+
+	route = mod_nats_globals.event_routing;
+	nobs = mod_nats_methods_copy_audience(uuid, owner, sizeof(owner), obs, MOD_NATS_MAX_OBSERVERS);
+	if (route != EVENT_ROUTE_MAILBOX || zstr(owner)) {
+		snprintf(subjects[nsub], sizeof(subjects[0]), "%sevent.detected", mod_nats_globals.subject_prefix);
+		nsub++;
+	}
+	if (route != EVENT_ROUTE_BROADCAST) {
+		if (!zstr(owner)) {
+			copy_subject(subjects[nsub], sizeof(subjects[0]), mod_nats_subject_ctrl(owner));
+			nsub++;
+		}
+		for (i = 0; i < nobs; i++) {
+			copy_subject(subjects[nsub], sizeof(subjects[0]), mod_nats_subject_ctrl(obs[i]));
+			nsub++;
+		}
+	}
+	if (nsub) {
+		publish_fanout("Event.Detected", params, subjects, nsub);
+	} else {
+		cJSON_Delete(params);
 	}
 }
 
@@ -371,6 +426,9 @@ static void dispatch_event(switch_event_t *event)
 			}
 		}
 		break;
+	case SWITCH_EVENT_DTMF:
+		handle_dtmf_event(event);
+		break;
 	case SWITCH_EVENT_CUSTOM:
 	case SWITCH_EVENT_ALL:
 		handle_native_event(event);
@@ -393,6 +451,7 @@ static int is_channel_event(switch_event_types_t id)
 	case SWITCH_EVENT_CHANNEL_BRIDGE:
 	case SWITCH_EVENT_CHANNEL_UNBRIDGE:
 	case SWITCH_EVENT_CHANNEL_HANGUP_COMPLETE:
+	case SWITCH_EVENT_DTMF:
 		return 1;
 	default:
 		return 0;
@@ -458,6 +517,10 @@ static switch_event_t *slim_channel_event(switch_event_t *event)
 		for (i = 0; cdr_keys[i]; i++) {
 			copy_header(dup, event, cdr_keys[i]);
 		}
+	}
+	if (event->event_id == SWITCH_EVENT_DTMF) {
+		copy_header(dup, event, "DTMF-Digit");
+		copy_header(dup, event, "DTMF-Duration");
 	}
 	uuid = switch_event_get_header(event, "Unique-ID");
 	global_csv[0] = '\0';
@@ -542,7 +605,8 @@ static const switch_event_types_t MOD_NATS_CHANNEL_EVENTS[] = {
 	SWITCH_EVENT_CHANNEL_ANSWER,
 	SWITCH_EVENT_CHANNEL_BRIDGE,
 	SWITCH_EVENT_CHANNEL_UNBRIDGE,
-	SWITCH_EVENT_CHANNEL_HANGUP_COMPLETE
+	SWITCH_EVENT_CHANNEL_HANGUP_COMPLETE,
+	SWITCH_EVENT_DTMF
 };
 
 static switch_status_t bind_events(void)

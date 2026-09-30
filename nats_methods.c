@@ -1552,6 +1552,51 @@ static switch_status_t mn_touch(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *e
 	return SWITCH_STATUS_SUCCESS;
 }
 
+/* XNode.Record / fs.channel.record: start/stop/pause/resume/mask/unmask a
+ * session recording. Mirrors mod_commands uuid_record semantics: the file
+ * path is the recording key, so STOP must repeat the same path. */
+static switch_status_t mn_record(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *extra)
+{
+	switch_core_session_t *session;
+	cJSON *jaction = cJSON_GetObjectItem(params, "action");
+	cJSON *jfile = cJSON_GetObjectItem(params, "file");
+	cJSON *jlimit = cJSON_GetObjectItem(params, "limit");
+	const char *action, *file;
+	uint32_t limit = 0;
+	switch_status_t st = SWITCH_STATUS_FALSE;
+	switch_status_t own;
+
+	if ((own = require_owner(ctx, params, extra)) != SWITCH_STATUS_SUCCESS) {
+		return own;
+	}
+	action = (jaction && cJSON_IsString(jaction) && !zstr(jaction->valuestring)) ? jaction->valuestring : "RECORD";
+	file = (jfile && cJSON_IsString(jfile) && !zstr(jfile->valuestring)) ? jfile->valuestring : NULL;
+	if (!file || switch_stristr("..", file)) {
+		return SWITCH_STATUS_FALSE;
+	}
+	if (jlimit && cJSON_IsNumber(jlimit) && jlimit->valueint > 0) {
+		limit = (uint32_t) jlimit->valueint;
+	}
+	if (!(session = session_from_params(params, NULL, 0))) {
+		return SWITCH_STATUS_NOTFOUND;
+	}
+	if (!strcasecmp(action, "RECORD") || !strcasecmp(action, "START")) {
+		st = switch_ivr_record_session_event(session, file, limit, NULL, NULL);
+	} else if (!strcasecmp(action, "STOP")) {
+		st = switch_ivr_stop_record_session(session, file);
+	} else if (!strcasecmp(action, "PAUSE")) {
+		st = switch_ivr_record_session_pause(session, file, SWITCH_TRUE);
+	} else if (!strcasecmp(action, "RESUME")) {
+		st = switch_ivr_record_session_pause(session, file, SWITCH_FALSE);
+	} else if (!strcasecmp(action, "MASK")) {
+		st = switch_ivr_record_session_mask(session, file, SWITCH_TRUE);
+	} else if (!strcasecmp(action, "UNMASK")) {
+		st = switch_ivr_record_session_mask(session, file, SWITCH_FALSE);
+	}
+	switch_core_session_rwunlock(session);
+	return st == SWITCH_STATUS_SUCCESS ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
+}
+
 /* Method table: canonical fs.* names with XCC aliases (xctrl SDK compat,
  * gated by the compat-xcc config). Keep names in sync with README. */
 const mod_nats_method_t mod_nats_methods[] = {
@@ -1565,6 +1610,7 @@ const mod_nats_method_t mod_nats_methods[] = {
 	{"fs.channel.play", "XNode.Play", mn_play, SWITCH_TRUE},
 	{"fs.channel.stop", "XNode.Stop", mn_stop, SWITCH_TRUE},
 	{"fs.channel.broadcast", "XNode.Broadcast", mn_broadcast, SWITCH_TRUE},
+	{"fs.channel.record", "XNode.Record", mn_record, SWITCH_TRUE},
 	{"fs.channel.bridge", "XNode.Bridge", bridge_two, SWITCH_TRUE},
 	{"fs.channel.setvar", "XNode.SetVar", mn_setvar, SWITCH_TRUE},
 	{"fs.channel.getvar", "XNode.GetVar", mn_getvar, SWITCH_TRUE},

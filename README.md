@@ -115,6 +115,7 @@ NATS 消息总线集成模块。为 FreeSWITCH 提供通用的呼叫控制面、
 | `Event.Metrics` | `{prefix}metrics` | 配置了 `metrics-interval`（秒，大于 0）之后按该间隔发送。`js-metrics=true` 时走 JetStream |
 | `Event.Result` | `{prefix}ctrl.{ctrl_uuid}` | `XNode.Dial` 的异步结果，带原来的 JSON-RPC `id`。不走 JetStream |
 | `Event.OwnerLost` | `{prefix}event.ownerlost`，以及原 owner 的 `{prefix}ctrl.{ctrl_uuid}` | `owner-lease-ttl > 0` 且 owner 连续 N 秒没有任何成功控制请求/touch：释放通道，备用控制器可重新 Accept |
+| `Event.Detected` | `{prefix}event.detected`，以及 owner/观察者的 `{prefix}ctrl.{ctrl_uuid}` | 通道上检测到输入。当前为 DTMF（`type=dtmf`，每按键一条，带 `duration`）。事件驱动式取代阻塞的 XNode.ReadDTMF |
 | `Event.NativeEvent` | `{prefix}event.{事件名小写}` | 仅 `publish-native-events=true`。`SWITCH_EVENT_LOG` 一律丢弃 |
 
 `Event.Channel` 的 `params.state` 与 FreeSWITCH 事件的对应关系：
@@ -159,6 +160,7 @@ nats sub 'nats.fs.ctrl.>'       # 信箱：通道事件与 Event.Result
 | `fs.channel.play` | `XNode.Play` | 是 |
 | `fs.channel.stop` | `XNode.Stop` | 是 |
 | `fs.channel.broadcast` | `XNode.Broadcast` | 是 |
+| `fs.channel.record` | `XNode.Record` | 是。`action` RECORD/STOP/PAUSE/RESUME/MASK/UNMASK，`file` 是录音键（STOP 要传同一路径） |
 | `fs.channel.bridge` | `XNode.Bridge` | 是，两条腿都必须是本 ctrl |
 | `fs.channel.setvar` | `XNode.SetVar` | 是 |
 | `fs.channel.getvar` | `XNode.GetVar` | 是 |
@@ -199,16 +201,17 @@ result.code 语义：200 成功 / 202 已受理（结果走 Event.Result）/ 400
 | fs.channel.observe / unobserve | 观察者：不获得控制权。`event-routing` 为 `mailbox` 或 `both` 时，事件进入该 ctrl 信箱。每通道最多 32 个 |
 | XNode.Answer / Hangup | 应答 / 挂机。必须先 Accept；非 owner 返回 419 |
 | XNode.Play / Stop / Broadcast | 放音 / 停止放音 / 广播媒体 |
+| XNode.Record | 通道录音：RECORD/STOP/PAUSE/RESUME/MASK/UNMASK，`file` 为录音键。路径含 `..` 拒绝 |
 | XNode.Bridge / ChannelBridge | 桥接两条通道 |
 | XNode.SetVar / GetVar / GetState / GetChannelData | 变量与状态读写 |
 | XNode.Dial | 外呼（bgapi originate，立即回 202 + job_uuid，结果走 Event.Result） |
 | XNode.JStatus | 节点状态：sessions/peak/sps/uptime/version |
 | XNode.NativeApp / NativeAPI / NativeJSAPI | NativeApp 需 owner，把 `cmd::args` 排进会话线程后立即返回，不等应用跑完。NativeAPI / NativeJSAPI 默认关闭，见 `allow-native-api` |
-| Event.Channel / Event.CDR / Event.Result / Event.OwnerLost | 事件与异步结果 |
+| Event.Channel / Event.CDR / Event.Result / Event.OwnerLost / Event.Detected | 事件与异步结果；Event.Detected 当前承载 DTMF（`type=dtmf`，每按键一条，走 owner/观察者信箱与 `event.detected`），事件驱动式取代阻塞的 ReadDTMF |
 
 **所有权租约**（`owner-lease-ttl > 0` 时启用）：Accept/Dial 成功即起租；此后每一个成功的 owner 控制请求（含 `fs.channel.touch`）都会把租约顺延一个 ttl。连续 N 秒没有任何 owner 活动，通道绑定被释放并广播 `Event.OwnerLost`（原 owner 信箱 + `event.ownerlost` 公共主题），备用控制器可重新 Accept。外呼尚未 ringing 完成的 uuid（session 还不存在）不会被释放，租约顺延。建议 ttl 大于最长的 Dial 超时。owner 掉线后通道保持运行不受影响，只是控制权回到可接管状态——这是"controller 死了通道还能救"的兜底。
 
-**未实现（规划中）**：UnBridge2、Transfer、Hold、ThreeWay、Mute、ReadDTMF、DetectSpeech（ASR，可对接 mod_ws_audio）、Record、Conference 系列、MediaFork。NativeApp 在通道已被 Accept 后仍可把 dialplan app 排进该通道的会话线程。
+**未实现（规划中）**：UnBridge2、Transfer、Hold、ThreeWay、Mute、DetectSpeech（ASR，可对接 mod_ws_audio）、Conference 系列、MediaFork。DTMF 已由 `Event.Detected` 事件驱动提供，不再规划阻塞式的 ReadDTMF。NativeApp 在通道已被 Accept 后仍可把 dialplan app 排进该通道的会话线程。
 
 **未 Accept 的通道拒绝控制方法**（400 `channel not accepted`）。`fs.channel.accept` 之后只有 owner 可以控制。`fs.channel.observe` 在 Accept 之前也可以订阅信箱。
 
