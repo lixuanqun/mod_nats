@@ -150,6 +150,8 @@ static switch_status_t config_load(switch_bool_t reload)
 				mod_nats_globals.accept_timeout_sec = atoi(val);
 			} else if (!strcmp(name, "owner-lease-ttl")) {
 				mod_nats_globals.owner_lease_sec = atoi(val);
+			} else if (!strcmp(name, "idempotency-cache-size")) {
+				mod_nats_globals.idem_cache_size = atoi(val);
 			} else if (!strcmp(name, "metrics-interval")) {
 				mod_nats_globals.metrics_interval = atoi(val);
 			} else if (!strcmp(name, "compat-xcc")) {
@@ -194,6 +196,8 @@ static switch_status_t config_load(switch_bool_t reload)
 	if (mod_nats_globals.accept_timeout_sec > 86400) mod_nats_globals.accept_timeout_sec = 86400;
 	if (mod_nats_globals.owner_lease_sec < 0) mod_nats_globals.owner_lease_sec = 0;
 	if (mod_nats_globals.owner_lease_sec > 86400) mod_nats_globals.owner_lease_sec = 86400;
+	if (mod_nats_globals.idem_cache_size < 0) mod_nats_globals.idem_cache_size = 0;
+	if (mod_nats_globals.idem_cache_size > 65536) mod_nats_globals.idem_cache_size = 65536;
 
 	if (reload) {
 		int conn_changed = strcmp(mod_nats_globals.urls, urls_save) ||
@@ -238,6 +242,7 @@ switch_status_t mod_nats_config_reload(void)
 	if (st == SWITCH_STATUS_SUCCESS) {
 		mod_nats_events_rebind();
 		mod_nats_js_ensure();
+		mod_nats_proto_idem_init();		/* no-op unless the cache was disabled at load */
 		if (mod_nats_globals.metrics_interval > 0 && !mod_nats_globals.metrics_thread) {
 			mod_nats_metrics_start();
 		}
@@ -248,6 +253,7 @@ switch_status_t mod_nats_config_reload(void)
 static switch_status_t api_status(switch_stream_handle_t *stream)
 {
 	uint64_t in, out, dropped, errs, ev, since, js_fb;
+	uint64_t idem_hits, idem_stores;
 
 	switch_mutex_lock(mod_nats_globals.mutex);
 	in = mod_nats_globals.msgs_in;
@@ -256,6 +262,8 @@ static switch_status_t api_status(switch_stream_handle_t *stream)
 	errs = mod_nats_globals.pub_errors;
 	ev = mod_nats_globals.events_out;
 	js_fb = mod_nats_globals.js_fallbacks;
+	idem_hits = mod_nats_globals.idem_hits;
+	idem_stores = mod_nats_globals.idem_stores;
 	since = (uint64_t) ((switch_time_now() - mod_nats_globals.started) / 1000000);
 	switch_mutex_unlock(mod_nats_globals.mutex);
 
@@ -282,6 +290,9 @@ static switch_status_t api_status(switch_stream_handle_t *stream)
 	stream->write_function(stream, "native api    %s\n", mod_nats_globals.allow_native_api ? "on" : "off");
 	stream->write_function(stream, "accept timeout %ds\n", mod_nats_globals.accept_timeout_sec);
 	stream->write_function(stream, "owner lease   ttl=%ds\n", mod_nats_globals.owner_lease_sec);
+	stream->write_function(stream, "idempotent    cache=%d hits=%lu stored=%lu\n",
+						   mod_nats_globals.idem_cache_size,
+						   (unsigned long) idem_hits, (unsigned long) idem_stores);
 	stream->write_function(stream, "uptime        %lus\n", (unsigned long) since);
 	stream->write_function(stream, "msgs in/out   %lu / %lu\n", (unsigned long) in, (unsigned long) out);
 	stream->write_function(stream, "events out    %lu\n", (unsigned long) ev);
@@ -335,6 +346,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_nats_load)
 	mod_nats_globals.accept_timeout_sec = 0;
 	mod_nats_globals.compat_xcc = SWITCH_TRUE;
 	mod_nats_globals.event_routing = EVENT_ROUTE_BOTH;
+	mod_nats_globals.idem_cache_size = 1024;
 	switch_copy_string(mod_nats_globals.urls, "nats://127.0.0.1:4222", sizeof(mod_nats_globals.urls));
 	switch_copy_string(mod_nats_globals.subject_prefix, MOD_NATS_DEFAULT_PREFIX, sizeof(mod_nats_globals.subject_prefix));
 
@@ -353,6 +365,8 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_nats_load)
 	switch_queue_create(&mod_nats_globals.req_queue, mod_nats_globals.req_qlen, pool);
 	switch_queue_create(&mod_nats_globals.dial_queue, mod_nats_globals.req_qlen, pool);
 
+	mod_nats_proto_idem_init();
+
 	SWITCH_ADD_API(api_interface, "nats", "NATS bus interface", api_function, "status | reload");
 	switch_console_set_complete("add nats status");
 	switch_console_set_complete("add nats reload");
@@ -365,6 +379,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_nats_load)
 		switch_safe_free(mod_nats_globals.credentials);
 		switch_safe_free(mod_nats_globals.cdr_subject);
 		switch_safe_free(mod_nats_globals.channel_params);
+		mod_nats_proto_idem_shutdown();
 		switch_core_hash_destroy(&mod_nats_globals.chan_hash);
 		return SWITCH_STATUS_FALSE;
 	}
@@ -397,6 +412,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_nats_load)
 		switch_safe_free(mod_nats_globals.credentials);
 		switch_safe_free(mod_nats_globals.cdr_subject);
 		switch_safe_free(mod_nats_globals.channel_params);
+		mod_nats_proto_idem_shutdown();
 		switch_core_hash_destroy(&mod_nats_globals.chan_hash);
 		return SWITCH_STATUS_FALSE;
 	}
@@ -444,6 +460,7 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_nats_shutdown)
 	switch_safe_free(mod_nats_globals.cdr_subject);
 	switch_safe_free(mod_nats_globals.channel_params);
 
+	mod_nats_proto_idem_shutdown();
 	switch_core_hash_destroy(&mod_nats_globals.chan_hash);
 
 	return SWITCH_STATUS_SUCCESS;

@@ -1,5 +1,21 @@
 # mod_nats 本地全链路与压测记录
 
+## 2026-10-01 v0.4.3：幂等键（重试安全）
+
+环境同前。幂等缓存全部实现在协议层（方法零改动）：`(params.uuid 或节点, ctrl_uuid, idempotency_key)` 作用域，只缓存 2xx 结果，FIFO 容量 `idempotency-cache-size`（默认 1024）。**86/86 通过**（新增 11 项）：
+
+| 用例 | 结果 |
+|------|------|
+| `XNode.Play` 带 key → 同 key 重试 | 第二次不执行，回放缓存结果并带 `idempotent_replay=true` |
+| 新 key | 全新执行，无 replay 标记 |
+| 同 key 换 ctrl（`fs.node.status`） | 不命中（作用域含 ctrl_uuid） |
+| 同 key 同 ctrl 再次请求 | 命中回放 |
+| `DetectSpeech` 未知引擎带 key → 重试 | 两次都 400，失败不缓存 |
+| 200 字符 key | 400 `idempotency key too long` |
+| `XNode.Dial` 带 key → 同 key 重试 | 回放原始 202，**job_uuid 相同**，`idempotent_replay=true`；呼叫正常建立并挂断 |
+| `nats status` | `idempotent cache=1024 hits=3 stored=5`，与测试用例数吻合 |
+| `reload mod_nats` | 缓存随模块重载清空（行为已写入 README 已知限制） |
+
 ## 2026-10-01 v0.4.2：DetectSpeech 第一层（ASR 事件转发）
 
 环境同前（docker-lab + `loopback/9001 &park`，test-node-01，租约 ttl=4）。新增：镜像加编 mod_test（FS 树内的罐头 ASR 引擎 `test`，单文件编译，无外部依赖）。**75/75 通过**，新增覆盖：

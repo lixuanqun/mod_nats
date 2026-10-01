@@ -17,10 +17,10 @@
 #include <nats/nats.h>
 
 #define MOD_NATS_NAME "mod_nats"
-/* Wire protocol version implemented by this module. 2.3.0 adds the owner
- * lease (2.1.0), fs.channel.record + Event.Detected DTMF (2.2.0) and
- * fs.channel.detectspeech + Event.Detected type=asr. */
-#define MOD_NATS_PROTO_VERSION "2.3.0"
+/* Wire protocol version implemented by this module. 2.4.0 adds the owner
+ * lease (2.1.0), fs.channel.record + Event.Detected DTMF (2.2.0),
+ * fs.channel.detectspeech + type=asr (2.3.0) and idempotency_key replays. */
+#define MOD_NATS_PROTO_VERSION "2.4.0"
 
 #define MOD_NATS_PREFIX_MAX 64
 #define MOD_NATS_URLS_MAX 1024
@@ -150,6 +150,13 @@ struct mod_nats_globals_s {
 	switch_bool_t pub_stop;			/* reply + event publishers exit only after dial threads finish */
 	switch_bool_t event_stop;		/* serializer exits after the FS event bind is gone */
 
+	/* idempotency cache: (uuid|node scope, ctrl_uuid, key) -> last 2xx result */
+	int idem_cache_size;			/* FIFO cap, 0 disables the feature; default 1024 */
+	switch_hash_t *idem_hash;
+	switch_queue_t *idem_fifo;		/* insertion order for FIFO eviction */
+	uint64_t idem_hits;
+	uint64_t idem_stores;
+
 	/* stats (atomic-ish under mutex) */
 	uint64_t msgs_in;
 	uint64_t msgs_out;
@@ -187,6 +194,13 @@ void mod_nats_proto_handle_request(mod_nats_req_t *req);
 void mod_nats_proto_send_reply(const char *reply, const char *rpc_id, cJSON *result);
 void mod_nats_proto_send_reply_hdr(const char *reply, const char *rpc_id, int rpc_id_is_number, const char *rpc_id_header, cJSON *result);
 void mod_nats_proto_send_error(const char *reply, const char *rpc_id, int code, const char *message);
+/* idempotency result cache: repeated (uuid, ctrl_uuid, key) with a stored
+ * 2xx result replays it instead of executing again. Failures are never
+ * cached, so a retry after a failure re-executes. */
+void mod_nats_proto_idem_init(void);
+void mod_nats_proto_idem_shutdown(void);
+cJSON *mod_nats_proto_idem_lookup(const char *key);
+void mod_nats_proto_idem_store(const char *key, const char *json);
 const char *mod_nats_subject_node(void);
 const char *mod_nats_subject_ctrl(const char *ctrl_uuid);
 const char *mod_nats_subject_event(const char *event_name);

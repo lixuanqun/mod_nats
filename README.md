@@ -193,6 +193,17 @@ nats sub 'nats.fs.ctrl.>'       # 信箱：通道事件与 Event.Result
 
 result.code 语义：200 成功 / 202 已受理（结果走 Event.Result）/ 400 拒绝 / 404 通道不存在 / 419 已被其他控制器接管 / 500 内部错误 / 501 未实现。
 
+### 幂等键（重试安全）
+
+所有方法都接受可选的 `idempotency_key`（1–128 字符，放在 params 里），控制器超时重试时带上同一个 key 即可防止重复执行：
+
+- **作用域**是 `(params.uuid, ctrl_uuid)`：同一控制器对同一目标重试同一 key 才命中；不同控制器、不同通道互不影响。无 `uuid` 的方法（JStatus、Dial 等）作用域是节点级。
+- **命中**时不执行方法，直接返回上次结果，并带 `idempotent_replay: true`。
+- **只缓存 2xx**：失败不缓存，重试会重新执行（失败的尝试可以安全重试）。
+- **外呼的异步语义**：重试返回原始的 202 + job_uuid 回执，不是呼叫的最终结果——`origination_uuid` 预占保证了同一 uuid 不会被拨两次。
+- 天然幂等无需 key：Answer / Hangup / Stop / SetVar / GetVar / GetState / GetChannelData / Touch / JStatus / observe。建议带 key：Play / Broadcast / Record(RECORD) / DetectSpeech(START) / Dial。
+- 缓存容量 `idempotency-cache-size`（默认 1024，FIFO 淘汰，0 关闭），`nats status` 的 `idempotent` 行可观测。
+
 ### 已实现方法（v0.4）
 
 | 方法 | 说明 |
@@ -251,6 +262,8 @@ result.code 语义：200 成功 / 202 已受理（结果走 Event.Result）/ 400
     <param name="accept-timeout" value="0"/>
     <!-- 所有权租约：owner 连续 N 秒没有成功控制请求/touch 就释放通道并广播 Event.OwnerLost，0 关闭（默认）。建议大于最长的 Dial 超时 -->
     <param name="owner-lease-ttl" value="0"/>
+    <!-- 幂等结果缓存容量（FIFO 淘汰）。重复的 (uuid, ctrl_uuid, idempotency_key) 且上次执行为 2xx 时回放缓存结果，0 关闭 -->
+    <param name="idempotency-cache-size" value="1024"/>
     <!-- fs.native.api / fs.native.jsapi。默认关 -->
     <param name="allow-native-api" value="false"/>
     <!-- 事件附加通道变量白名单（逗号分隔） -->
@@ -328,6 +341,7 @@ nats stream add FS_METRICS --subjects 'nats.fs.metrics' --storage file --default
 
 - `XNode.Dial` 立刻回 202。拨号在独立线程里进行，数量与 `workers` 相同，队列与 `req-qsize` 相同。队列满返回 503。结果仍是 ctrl 信箱上的 Event.Result。卸载时，已经在拨的呼叫会拨完；还排在队列里的回 480 shutting down。外呼前会占住 `origination_uuid`。
 - 租约到期只释放绑定并广播 `Event.OwnerLost`，不挂机、不改变通道状态。若 ttl 小于 Dial 时长，originate 期间可能发出一次多余的 OwnerLost，随后 Dial 完成时 owner 重新登记。把 ttl 配得比最长 Dial 超时大即可避免。
+- `reload mod_nats` 是模块级重载：通道绑定与幂等缓存一并清空。重载后的重试不再命中缓存，可能重复执行——控制器侧的重试窗口应避开模块重载，或把重载当作故障转移事件处理。
 - 未 Accept 的通道不能执行控制方法。`fs.native.api` / `fs.native.jsapi` 默认关闭。
 - `global_params` 会写成 originate 变量，但 `execute_on_*` / `api_on_*` / `api_hangup_hook` / `exec_after_*` 会被拒绝。
 - 需要 libnats >= 3.0 才能编译。Windows 工程（.vcxproj）未创建。

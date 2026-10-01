@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://freeswitch.org/mod_nats/schema/catalog.json",
   "title": "mod_nats wire catalog",
-  "description": "JSON-RPC 2.0 methods and events for mod_nats protocol 2.3.0. Canonical names are fs.*; XNode.* aliases are accepted when compat-xcc is on. Requests go to {prefix}node.{node_uuid}. Owner and observer events go to {prefix}ctrl.{ctrl_uuid}.",
+  "description": "JSON-RPC 2.0 methods and events for mod_nats protocol 2.4.0. Canonical names are fs.*; XNode.* aliases are accepted when compat-xcc is on. Requests go to {prefix}node.{node_uuid}. Owner and observer events go to {prefix}ctrl.{ctrl_uuid}.",
   "type": "object",
   "$defs": {
     "rpcId": {
@@ -33,7 +33,10 @@
         "jsonrpc": { "const": "2.0" },
         "id": { "$ref": "#/$defs/rpcId", "description": "Absent id means a notification: the method runs and no reply is sent." },
         "method": { "type": "string" },
-        "params": { "type": "object" }
+        "params": {
+          "type": "object",
+          "description": "Method arguments. Every method accepts an optional idempotency_key (1-128 chars) scoped by (params.uuid, ctrl_uuid): a repeat whose previous execution finished 200/202 replays the stored result with idempotent_replay=true instead of executing again. Failures are never cached."
+        }
       }
     },
     "result": {
@@ -45,7 +48,11 @@
           "description": "200 OK, 202 accepted, 400 refused, 404 no channel, 419 owned by someone else, 480 dial failed, 500 internal, 501 unknown method, 503 queue full."
         },
         "message": { "type": "string" },
-        "node_uuid": { "type": "string" }
+        "node_uuid": { "type": "string" },
+        "idempotent_replay": {
+          "type": "boolean",
+          "description": "True when the result was replayed from the idempotency cache instead of executing again."
+        }
       },
       "additionalProperties": true
     },

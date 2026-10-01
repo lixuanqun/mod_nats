@@ -30,6 +30,10 @@
          standby controllers can then re-Accept. 0 disables. Keep it larger
          than your longest Dial timeout. -->
     <param name="owner-lease-ttl" value="0"/>
+    <!-- idempotency result cache cap (FIFO eviction). A repeated
+         (uuid, ctrl_uuid, idempotency_key) whose last execution was 2xx
+         replays the stored result. 0 disables. -->
+    <param name="idempotency-cache-size" value="1024"/>
     <!-- fs.native.api and fs.native.jsapi; keep false unless the bus is trusted -->
     <param name="allow-native-api" value="false"/>
     <!-- Event.Metrics period in seconds; 0 disables. Subject is {prefix}metrics -->

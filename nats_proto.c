@@ -91,6 +91,121 @@ static cJSON *build_result(int code, const char *message)
 	return result;
 }
 
+/* --------------------------------------------------------------------- */
+/* idempotency result cache: (uuid|node, ctrl_uuid, key) -> serialized   */
+/* 2xx reply. First store wins, failures are never cached so a retry     */
+/* after a failure re-executes, and eviction is FIFO by insertion.       */
+
+typedef struct mod_nats_idem_entry_s {
+	char *json;
+} mod_nats_idem_entry_t;
+
+static void idem_entry_free(void *ptr)
+{
+	mod_nats_idem_entry_t *e = (mod_nats_idem_entry_t *) ptr;
+
+	if (e) {
+		switch_safe_free(e->json);
+		free(e);
+	}
+}
+
+void mod_nats_proto_idem_init(void)
+{
+	if (mod_nats_globals.idem_cache_size <= 0 || mod_nats_globals.idem_hash) {
+		return;
+	}
+	if (switch_core_hash_init(&mod_nats_globals.idem_hash) != SWITCH_STATUS_SUCCESS) {
+		return;
+	}
+	if (switch_queue_create(&mod_nats_globals.idem_fifo, 65536, mod_nats_globals.pool) != SWITCH_STATUS_SUCCESS) {
+		mod_nats_globals.idem_fifo = NULL;
+	}
+}
+
+void mod_nats_proto_idem_shutdown(void)
+{
+	void *pop = NULL;
+
+	while (mod_nats_globals.idem_fifo &&
+		   switch_queue_trypop(mod_nats_globals.idem_fifo, &pop) == SWITCH_STATUS_SUCCESS && pop) {
+		free(pop);
+	}
+	if (mod_nats_globals.idem_hash) {
+		switch_core_hash_destroy(&mod_nats_globals.idem_hash);
+		mod_nats_globals.idem_hash = NULL;
+	}
+	mod_nats_globals.idem_fifo = NULL;
+}
+
+/* Returns a freshly parsed copy of the stored result (caller consumes). */
+cJSON *mod_nats_proto_idem_lookup(const char *key)
+{
+	mod_nats_idem_entry_t *e = NULL;
+	cJSON *parsed = NULL;
+
+	if (!mod_nats_globals.idem_hash || zstr(key)) {
+		return NULL;
+	}
+	switch_mutex_lock(mod_nats_globals.mutex);
+	e = (mod_nats_idem_entry_t *) switch_core_hash_find(mod_nats_globals.idem_hash, key);
+	if (e && e->json) {
+		parsed = cJSON_Parse(e->json);
+	}
+	if (e) {
+		mod_nats_globals.idem_hits++;
+	}
+	switch_mutex_unlock(mod_nats_globals.mutex);
+	return parsed;
+}
+
+void mod_nats_proto_idem_store(const char *key, const char *json)
+{
+	mod_nats_idem_entry_t *e;
+	char *fifo_key;
+
+	if (!mod_nats_globals.idem_hash || !mod_nats_globals.idem_fifo || zstr(key) || zstr(json)) {
+		return;
+	}
+	switch_mutex_lock(mod_nats_globals.mutex);
+	if (switch_core_hash_find(mod_nats_globals.idem_hash, key)) {
+		switch_mutex_unlock(mod_nats_globals.mutex);
+		return;						/* first store wins */
+	}
+	e = (mod_nats_idem_entry_t *) calloc(1, sizeof(*e));
+	if (!e) {
+		switch_mutex_unlock(mod_nats_globals.mutex);
+		return;
+	}
+	e->json = strdup(json);
+	if (!e->json) {
+		switch_safe_free(e);
+		switch_mutex_unlock(mod_nats_globals.mutex);
+		return;
+	}
+	if (switch_core_hash_insert_destructor(mod_nats_globals.idem_hash, key, e, idem_entry_free) != SWITCH_STATUS_SUCCESS) {
+		idem_entry_free(e);
+		switch_mutex_unlock(mod_nats_globals.mutex);
+		return;
+	}
+	while (switch_queue_size(mod_nats_globals.idem_fifo) >= (unsigned int) mod_nats_globals.idem_cache_size) {
+		void *old = NULL;
+
+		if (switch_queue_trypop(mod_nats_globals.idem_fifo, &old) != SWITCH_STATUS_SUCCESS || !old) {
+			break;
+		}
+		switch_core_hash_delete(mod_nats_globals.idem_hash, (const char *) old);
+		free(old);
+	}
+	if ((fifo_key = strdup(key)) != NULL) {
+		if (switch_queue_trypush(mod_nats_globals.idem_fifo, fifo_key) != SWITCH_STATUS_SUCCESS) {
+			free(fifo_key);
+		}
+	}
+	mod_nats_globals.idem_stores++;
+	switch_mutex_unlock(mod_nats_globals.mutex);
+}
+
 void mod_nats_proto_send_reply_hdr(const char *reply, const char *rpc_id, int rpc_id_is_number, const char *rpc_id_header, cJSON *result)
 {
 	cJSON *env;
@@ -158,7 +273,9 @@ void mod_nats_proto_handle_request(mod_nats_req_t *req)
 	const mod_nats_method_t *m;
 	char rpc_id[128] = "";
 	char req_hdr[128] = "";
+	char idem_key[512] = "";
 	int rpc_id_is_number = 0;
+	int replied = 0;
 	switch_status_t st;
 	int code = 200;
 	const char *msg = "OK";
@@ -211,6 +328,39 @@ void mod_nats_proto_handle_request(mod_nats_req_t *req)
 			switch_copy_string(ctx.ctrl_uuid, jctrl->valuestring, sizeof(ctx.ctrl_uuid));
 		}
 
+		/* idempotency key: optional client-supplied retry token scoped by
+		 * (params.uuid or the node, ctrl_uuid). A repeat whose previous
+		 * execution finished 200/202 replays the stored result instead of
+		 * running the method again; failures are never cached. */
+		{
+			cJSON *jkey = cJSON_GetObjectItem(params, "idempotency_key");
+
+			if (jkey && cJSON_IsString(jkey) && !zstr(jkey->valuestring)) {
+				if (strlen(jkey->valuestring) > 128) {
+					code = 400;
+					msg = "idempotency key too long";
+					goto finish;
+				} else {
+					cJSON *juuid = cJSON_GetObjectItem(params, "uuid");
+					const char *scope = (juuid && cJSON_IsString(juuid) && !zstr(juuid->valuestring)) ? juuid->valuestring : "*";
+					cJSON *cached;
+
+					snprintf(idem_key, sizeof(idem_key), "%s\x1f%s\x1f%s", scope, ctx.ctrl_uuid, jkey->valuestring);
+					if ((cached = mod_nats_proto_idem_lookup(idem_key)) != NULL) {
+						cJSON_AddBoolToObject(cached, "idempotent_replay", SWITCH_TRUE);
+						if (!zstr(rpc_id)) {
+							mod_nats_proto_send_reply_hdr(req->reply, rpc_id, rpc_id_is_number,
+														  req_hdr[0] ? req_hdr : NULL, cached);
+						} else {
+							cJSON_Delete(cached);
+						}
+						replied = 1;
+						goto finish;
+					}
+				}
+			}
+		}
+
 	if (cJSON_IsString(method) && !zstr(method->valuestring)) {
 		m = find_method(method->valuestring);
 		if (!m) {
@@ -256,9 +406,12 @@ void mod_nats_proto_handle_request(mod_nats_req_t *req)
 	} /* ctx scope */
 
   finish:
-	if (!zstr(rpc_id)) {
+	/* A request with an id gets a reply; a keyed notification (no id) skips
+	 * the reply but still caches its 2xx result so the retry replays. */
+	if (!replied && (!zstr(rpc_id) || idem_key[0])) {
 		cJSON *result = build_result(code, msg);
 		cJSON *item;
+		char *stored = NULL;
 
 		/* method extras override defaults (e.g. Dial's code 202 + job_uuid) */
 		while (extra && extra->child && (item = cJSON_DetachItemViaPointer(extra, extra->child)) != NULL) {
@@ -271,7 +424,25 @@ void mod_nats_proto_handle_request(mod_nats_req_t *req)
 				cJSON_Delete(item);
 			}
 		}
-		mod_nats_proto_send_reply_hdr(req->reply, rpc_id, rpc_id_is_number, req_hdr[0] ? req_hdr : NULL, result);
+		{
+			cJSON *jcode = cJSON_GetObjectItem(result, "code");
+			if (idem_key[0] && jcode && (jcode->valueint == 200 || jcode->valueint == 202)) {
+				stored = cJSON_PrintUnformatted(result);
+			}
+		}
+		if (!zstr(rpc_id)) {
+			mod_nats_proto_send_reply_hdr(req->reply, rpc_id, rpc_id_is_number, req_hdr[0] ? req_hdr : NULL, result);
+			result = NULL;
+		}
+		if (idem_key[0]) {
+			if (stored) {
+				mod_nats_proto_idem_store(idem_key, stored);
+			}
+			switch_safe_free(stored);
+		}
+		if (result) {
+			cJSON_Delete(result);
+		}
 	}
 
 	if (extra) {

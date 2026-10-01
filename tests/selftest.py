@@ -280,6 +280,65 @@ async def main():
         await cli.req_code("XNode.DetectSpeech", {"uuid": ua, "action": "STOP"}, 200,
                            "XNode.DetectSpeech(STOP) -> 200")
 
+    print("== idempotency keys ==")
+    tone2 = "tone_stream://%(200,0,600,800)"
+    pkey = {"uuid": ua, "media": {"file": tone2}, "idempotency_key": "play-1"}
+    out1 = await cli.req("XNode.Play", pkey)
+    out2 = await cli.req("XNode.Play", pkey)
+    check("Play with key -> 200", out1 is not None and out1.get("result", {}).get("code") == 200,
+          f"code={out1.get('result', {}).get('code') if out1 else None}")
+    check("Play retry replays cached result",
+          out2 is not None and out2.get("result", {}).get("code") == 200
+          and out2["result"].get("idempotent_replay") is True,
+          f"replay={out2.get('result', {}).get('idempotent_replay') if out2 else None}")
+    out3 = await cli.req("XNode.Play", {"uuid": ua, "media": {"file": tone2}, "idempotency_key": "play-2"})
+    check("new key executes fresh (no replay flag)",
+          out3 is not None and out3.get("result", {}).get("code") == 200
+          and out3["result"].get("idempotent_replay") is None,
+          f"replay={out3.get('result', {}).get('idempotent_replay') if out3 else None}")
+    # scope is (uuid|node, ctrl_uuid): same key under another ctrl must not hit
+    await cli.req("fs.node.status", {"idempotency_key": "scope-1", "ctrl_uuid": "other-ctrl"})
+    out5 = await cli.req("fs.node.status", {"idempotency_key": "scope-1"})
+    check("same key other ctrl executes (no replay)",
+          out5 is not None and out5["result"].get("idempotent_replay") is None,
+          f"replay={out5.get('result', {}).get('idempotent_replay') if out5 else None}")
+    out6 = await cli.req("fs.node.status", {"idempotency_key": "scope-1"})
+    check("same key same ctrl replays",
+          out6 is not None and out6["result"].get("idempotent_replay") is True,
+          f"replay={out6.get('result', {}).get('idempotent_replay') if out6 else None}")
+    # failures are never cached: the retry re-executes
+    await cli.req_code("XNode.DetectSpeech", {"uuid": ua, "engine": "nosuch", "grammar": "g",
+                                               "idempotency_key": "fail-1"}, 400,
+                       "DetectSpeech(bad engine, key) -> 400")
+    out7 = await cli.req("XNode.DetectSpeech", {"uuid": ua, "engine": "nosuch", "grammar": "g",
+                                                 "idempotency_key": "fail-1"})
+    check("failure not cached (no replay on retry)",
+          out7 is not None and out7.get("result", {}).get("code") == 400
+          and out7["result"].get("idempotent_replay") is None,
+          f"code={out7.get('result', {}).get('code') if out7 else None}")
+    await cli.req_code("fs.node.status", {"idempotency_key": "x" * 200}, 400, "overlong key -> 400")
+    # dial retry: the cached 202 carries the original job_uuid
+    ue = str(uuidlib.uuid4())
+    dparams = {"idempotency_key": "dial-1",
+               "destination": {"call_params": [{"uuid": ue, "dial_string": DEST}]}}
+    d1 = await cli.req("XNode.Dial", dparams)
+    d2 = await cli.req("XNode.Dial", dparams)
+    check("Dial retry replays 202 with same job_uuid",
+          d1 is not None and d2 is not None
+          and d1["result"].get("code") == 202 and d2["result"].get("code") == 202
+          and d1["result"].get("job_uuid") == d2["result"].get("job_uuid")
+          and d2["result"].get("idempotent_replay") is True,
+          f"job1={str(d1.get('result', {}).get('job_uuid'))[:8] if d1 else None} "
+          f"job2={str(d2.get('result', {}).get('job_uuid'))[:8] if d2 else None} "
+          f"replay={d2.get('result', {}).get('idempotent_replay') if d2 else None}")
+    if d1 and d1["result"].get("code") == 202:
+        check("Event START(E) [dial retry channel]", await wait_for(
+            lambda: find_event("Event.Channel", uuid=ue, state="START"), 10), ue[:12])
+        out = await cli.req("XNode.Hangup", {"uuid": ue})
+        check("XNode.Hangup(E) [ok if 200/400/404]",
+              out is not None and out.get("result", {}).get("code") in (200, 400, 404),
+              f"code={out.get('result', {}).get('code') if out else None}")
+
     print("== bridge A<->B ==")
     ub = await originate_parked(cli, "B")
     if ub:
