@@ -1,5 +1,19 @@
 # mod_nats 本地全链路与压测记录
 
+## 2026-10-01 v0.4.2：DetectSpeech 第一层（ASR 事件转发）
+
+环境同前（docker-lab + `loopback/9001 &park`，test-node-01，租约 ttl=4）。新增：镜像加编 mod_test（FS 树内的罐头 ASR 引擎 `test`，单文件编译，无外部依赖）。**75/75 通过**，新增覆盖：
+
+| 用例 | 结果 |
+|------|------|
+| `XNode.DetectSpeech` 未知引擎 | 400 `asr engine unavailable`（引擎探测在核心 API 层拒绝） |
+| `XNode.DetectSpeech(engine=test, grammar=g1)` | 200，识别挂在通道上 |
+| 静默 5s 后 mod_test no-input 超时 | `Event.Detected` type=asr 到达 owner 信箱，`speech_type=detected-speech`，`speech={"grammar":"g1","text":"","confidence":0,"error":"no_input"}`（body JSON 解析成功） |
+| 等待期间 `XNode.Touch` 续租循环 | 租约未过期（ttl=4 < no-input 5s，真实控制器的做法） |
+| `XNode.DetectSpeech(action=STOP)` | 200 |
+
+架构落点：mod_nats 全程未接触音频——`switch_ivr_detect_speech` 由核心分发到 `switch_asr_interface` 实现模块（mod_test/mod_pocketsphinx/mod_unimrcp 皆可），mod_nats 只做引擎无关的启停控制与 `SWITCH_EVENT_DETECTED_SPEECH` → `Event.Detected(type=asr)` 转发（事件瘦身复制 Speech-Type 头与 body，JSON 结果解析进 `speech` 对象，非 JSON 走 `text`）。与 DTMF 共享同一条 `Event.Detected` 通道和受众/路由逻辑。
+
 ## 2026-10-01 v0.4.1：DTMF 转发与录音
 
 环境同 v0.4.0 一轮（docker-lab，`loopback/9001 &park`，test-node-01，租约 ttl=4）。**70/70 通过**，新增覆盖：

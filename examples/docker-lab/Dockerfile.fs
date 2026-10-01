@@ -8,6 +8,10 @@ ARG NATS_C_URL=https://github.com/nats-io/nats.c/archive/refs/tags/v3.11.0.tar.g
 ARG NATS_C_MIRROR=https://ghproxy.net/https://github.com/nats-io/nats.c/archive/refs/tags/v3.11.0.tar.gz
 ARG LOOPBACK_URL=https://raw.githubusercontent.com/signalwire/freeswitch/v1.10.12/src/mod/endpoints/mod_loopback/mod_loopback.c
 ARG LOOPBACK_MIRROR=https://ghproxy.net/https://raw.githubusercontent.com/signalwire/freeswitch/v1.10.12/src/mod/endpoints/mod_loopback/mod_loopback.c
+# mod_test ships a canned ASR engine ("test") so the selftest can exercise
+# XNode.DetectSpeech end to end without a real recognizer.
+ARG MODTEST_URL=https://raw.githubusercontent.com/signalwire/freeswitch/v1.10.12/src/mod/applications/mod_test/mod_test.c
+ARG MODTEST_MIRROR=https://ghproxy.net/https://raw.githubusercontent.com/signalwire/freeswitch/v1.10.12/src/mod/applications/mod_test/mod_test.c
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential ca-certificates curl \
@@ -30,9 +34,11 @@ RUN mkdir -p /tmp/nats-src \
 
 COPY mod_nats.c mod_nats.h nats_conn.c nats_proto.c nats_methods.c nats_events.c /src/mod_nats/
 
-RUN mkdir -p /src/loopback /out \
+RUN mkdir -p /src/loopback /src/modtest /out \
     && (curl -fsSL --retry 2 -o /src/loopback/mod_loopback.c "$LOOPBACK_URL" \
         || curl -fsSL --retry 2 -o /src/loopback/mod_loopback.c "$LOOPBACK_MIRROR") \
+    && (curl -fsSL --retry 2 -o /src/modtest/mod_test.c "$MODTEST_URL" \
+        || curl -fsSL --retry 2 -o /src/modtest/mod_test.c "$MODTEST_MIRROR") \
     && gcc -shared -fPIC -O2 -Wall -Wno-unused-parameter -Wno-unused-function \
         -I/usr/local/freeswitch/include/freeswitch -I/usr/local/include \
         /src/mod_nats/mod_nats.c /src/mod_nats/nats_conn.c /src/mod_nats/nats_proto.c \
@@ -45,13 +51,20 @@ RUN mkdir -p /src/loopback /out \
         /src/loopback/mod_loopback.c \
         -L/usr/local/freeswitch/lib -Wl,-rpath,/usr/local/freeswitch/lib \
         -lfreeswitch -lm -lpthread \
-        -o /out/mod_loopback.so
+        -o /out/mod_loopback.so \
+    && gcc -shared -fPIC -O2 -Wall -Wno-unused-parameter -Wno-unused-function \
+        -I/usr/local/freeswitch/include/freeswitch \
+        /src/modtest/mod_test.c \
+        -L/usr/local/freeswitch/lib -Wl,-rpath,/usr/local/freeswitch/lib \
+        -lfreeswitch -lm -lpthread \
+        -o /out/mod_test.so
 
 ARG FS_IMAGE=aicc-fs:local-verify
 FROM ${FS_IMAGE}
 COPY --from=build /usr/local/lib/libnats.so* /usr/local/lib/
 COPY --from=build /out/mod_nats.so /usr/local/freeswitch/lib/freeswitch/mod/mod_nats.so
 COPY --from=build /out/mod_loopback.so /usr/local/freeswitch/lib/freeswitch/mod/mod_loopback.so
+COPY --from=build /out/mod_test.so /usr/local/freeswitch/lib/freeswitch/mod/mod_test.so
 COPY examples/docker-lab/nats.conf.xml /etc/freeswitch/autoload_configs/nats.conf.xml
 COPY examples/docker-lab/entrypoint-wrap.sh /entrypoint-wrap.sh
 RUN chmod 755 /entrypoint-wrap.sh && ldconfig

@@ -1597,6 +1597,85 @@ static switch_status_t mn_record(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *
 	return st == SWITCH_STATUS_SUCCESS ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
 }
 
+/* XNode.DetectSpeech / fs.channel.detectspeech: background speech detection
+ * via the FS core ASR API. mod_nats carries control and text results only;
+ * the audio path belongs to whichever module implements switch_asr_interface
+ * (mod_test, mod_pocketsphinx, mod_unimrcp, ...). START follows the
+ * documented flow: init -> set_params -> load_grammar. */
+static switch_status_t mn_detectspeech(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *extra)
+{
+	switch_core_session_t *session;
+	cJSON *jaction = cJSON_GetObjectItem(params, "action");
+	cJSON *jengine = cJSON_GetObjectItem(params, "engine");
+	cJSON *jgrammar = cJSON_GetObjectItem(params, "grammar");
+	cJSON *jname = cJSON_GetObjectItem(params, "name");
+	cJSON *jdest = cJSON_GetObjectItem(params, "dest");
+	cJSON *jparams = cJSON_GetObjectItem(params, "params");
+	cJSON *item;
+	const char *action, *engine, *grammar, *name, *dest;
+	switch_status_t st = SWITCH_STATUS_FALSE;
+	switch_status_t own;
+
+	if ((own = require_owner(ctx, params, extra)) != SWITCH_STATUS_SUCCESS) {
+		return own;
+	}
+	action = (jaction && cJSON_IsString(jaction) && !zstr(jaction->valuestring)) ? jaction->valuestring : "START";
+
+	if (!(session = session_from_params(params, NULL, 0))) {
+		return SWITCH_STATUS_NOTFOUND;
+	}
+
+	if (!strcasecmp(action, "STOP")) {
+		st = switch_ivr_stop_detect_speech(session);
+	} else if (!strcasecmp(action, "PAUSE")) {
+		st = switch_ivr_pause_detect_speech(session);
+	} else if (!strcasecmp(action, "RESUME")) {
+		st = switch_ivr_resume_detect_speech(session);
+	} else if (!strcasecmp(action, "START")) {
+		engine = (jengine && cJSON_IsString(jengine) && !zstr(jengine->valuestring)) ? jengine->valuestring : NULL;
+		grammar = (jgrammar && cJSON_IsString(jgrammar) && !zstr(jgrammar->valuestring)) ? jgrammar->valuestring : NULL;
+		if (!engine || !grammar) {
+			switch_core_session_rwunlock(session);
+			return SWITCH_STATUS_FALSE;
+		}
+		name = (jname && cJSON_IsString(jname) && !zstr(jname->valuestring)) ? jname->valuestring : "grammar";
+		dest = (jdest && cJSON_IsString(jdest) && !zstr(jdest->valuestring)) ? jdest->valuestring : NULL;
+
+		st = switch_ivr_detect_speech_init(session, engine, dest, NULL);
+		if (st != SWITCH_STATUS_SUCCESS) {
+			switch_core_session_rwunlock(session);
+			if (extra) {
+				cJSON_AddNumberToObject(extra, "code", 400);
+				cJSON_AddStringToObject(extra, "message", "asr engine unavailable");
+			}
+			return SWITCH_STATUS_FALSE;
+		}
+		if (jparams && cJSON_IsObject(jparams)) {
+			cJSON_ArrayForEach(item, jparams) {
+				if (item->string && cJSON_IsString(item) && !zstr(item->valuestring)) {
+					switch_ivr_set_param_detect_speech(session, item->string, item->valuestring);
+				}
+			}
+		}
+		st = switch_ivr_detect_speech_load_grammar(session, grammar, name);
+		if (st != SWITCH_STATUS_SUCCESS) {
+			switch_ivr_stop_detect_speech(session);
+			switch_core_session_rwunlock(session);
+			if (extra) {
+				cJSON_AddNumberToObject(extra, "code", 400);
+				cJSON_AddStringToObject(extra, "message", "grammar load failed");
+			}
+			return SWITCH_STATUS_FALSE;
+		}
+	} else {
+		switch_core_session_rwunlock(session);
+		return SWITCH_STATUS_FALSE;
+	}
+
+	switch_core_session_rwunlock(session);
+	return st == SWITCH_STATUS_SUCCESS ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
+}
+
 /* Method table: canonical fs.* names with XCC aliases (xctrl SDK compat,
  * gated by the compat-xcc config). Keep names in sync with README. */
 const mod_nats_method_t mod_nats_methods[] = {
@@ -1611,6 +1690,7 @@ const mod_nats_method_t mod_nats_methods[] = {
 	{"fs.channel.stop", "XNode.Stop", mn_stop, SWITCH_TRUE},
 	{"fs.channel.broadcast", "XNode.Broadcast", mn_broadcast, SWITCH_TRUE},
 	{"fs.channel.record", "XNode.Record", mn_record, SWITCH_TRUE},
+	{"fs.channel.detectspeech", "XNode.DetectSpeech", mn_detectspeech, SWITCH_TRUE},
 	{"fs.channel.bridge", "XNode.Bridge", bridge_two, SWITCH_TRUE},
 	{"fs.channel.setvar", "XNode.SetVar", mn_setvar, SWITCH_TRUE},
 	{"fs.channel.getvar", "XNode.GetVar", mn_getvar, SWITCH_TRUE},

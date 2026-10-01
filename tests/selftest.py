@@ -254,6 +254,32 @@ async def main():
     await cli.req_code("XNode.Record", {"uuid": ua, "action": "RECORD", "file": "/tmp/../etc/x.wav"}, 400,
                        "XNode.Record path traversal -> 400")
 
+    print("== ASR detect (mod_test engine, no-input path) ==")
+    await cli.req_code("XNode.DetectSpeech", {"uuid": ua, "engine": "nosuch", "grammar": "g"}, 400,
+                       "XNode.DetectSpeech(unknown engine) -> 400")
+    out = await cli.req("XNode.DetectSpeech", {"uuid": ua, "engine": "test", "grammar": "g1"})
+    check("XNode.DetectSpeech(test,g1) -> 200",
+          out is not None and out.get("result", {}).get("code") == 200,
+          f"result={str(out)[:140] if out else None}")
+    if out and out.get("result", {}).get("code") == 200:
+        # mod_test fires no-input after 5s of silence; a real controller
+        # keeps renewing the lease while waiting, so do the same
+        got = None
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not got:
+            await cli.req("XNode.Touch", {"uuid": ua})
+            got = find_event("Event.Detected", uuid=ua, type="asr")
+            if not got:
+                await asyncio.sleep(1.5)
+        check("Event.Detected type=asr", got is not None,
+              json.dumps(got[1].get("params", {}))[:180] if got else "timeout 15s")
+        if got:
+            sp = got[1].get("params", {}).get("speech", {})
+            check("ASR result is engine JSON", isinstance(sp, dict) and sp.get("error") == "no_input",
+                  f"speech={str(sp)[:140]}")
+        await cli.req_code("XNode.DetectSpeech", {"uuid": ua, "action": "STOP"}, 200,
+                           "XNode.DetectSpeech(STOP) -> 200")
+
     print("== bridge A<->B ==")
     ub = await originate_parked(cli, "B")
     if ub:

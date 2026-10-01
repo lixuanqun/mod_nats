@@ -282,15 +282,14 @@ static void handle_channel_event(switch_event_t *event)
 	}
 }
 
-/* DTMF arrives as Event.Detected on the owner/observer mailboxes and, per
- * event-routing, the public event.detected subject. Unclaimed channels only
- * publish publicly (same rule as channel events). */
-static void handle_dtmf_event(switch_event_t *event)
+/* Detected input (DTMF, ASR) arrives as Event.Detected on the owner/observer
+ * mailboxes and, per event-routing, the public event.detected subject.
+ * Unclaimed channels only publish publicly (same rule as channel events).
+ * fields is consumed and merged into the notification params. */
+static void publish_detected(const char *uuid, const char *type, cJSON *fields)
 {
-	const char *uuid = switch_event_get_header(event, "Unique-ID");
-	const char *digit = switch_event_get_header(event, "DTMF-Digit");
-	const char *duration = switch_event_get_header(event, "DTMF-Duration");
 	cJSON *params;
+	cJSON *item;
 	char owner[SWITCH_UUID_FORMATTED_LENGTH + 1];
 	char obs[MOD_NATS_MAX_OBSERVERS][SWITCH_UUID_FORMATTED_LENGTH + 1];
 	char subjects[MOD_NATS_MAX_OBSERVERS + 2][MOD_NATS_PREFIX_MAX + SWITCH_UUID_FORMATTED_LENGTH + 32];
@@ -299,18 +298,18 @@ static void handle_dtmf_event(switch_event_t *event)
 	int i;
 	int route;
 
-	if (zstr(uuid) || zstr(digit)) {
-		return;
-	}
-
 	params = cJSON_CreateObject();
 	cJSON_AddStringToObject(params, "node_uuid", mod_nats_globals.node_uuid);
-	cJSON_AddStringToObject(params, "uuid", uuid);
-	cJSON_AddStringToObject(params, "type", "dtmf");
-	cJSON_AddStringToObject(params, "dtmf", digit);
-	if (!zstr(duration)) {
-		cJSON_AddStringToObject(params, "duration", duration);
+	cJSON_AddStringToObject(params, "uuid", switch_str_nil(uuid));
+	cJSON_AddStringToObject(params, "type", type);
+	while (fields && fields->child && (item = cJSON_DetachItemViaPointer(fields, fields->child)) != NULL) {
+		if (!zstr(item->string)) {
+			cJSON_AddItemToObject(params, item->string, item);
+		} else {
+			cJSON_Delete(item);
+		}
 	}
+	cJSON_Delete(fields);
 
 	route = mod_nats_globals.event_routing;
 	nobs = mod_nats_methods_copy_audience(uuid, owner, sizeof(owner), obs, MOD_NATS_MAX_OBSERVERS);
@@ -333,6 +332,57 @@ static void handle_dtmf_event(switch_event_t *event)
 	} else {
 		cJSON_Delete(params);
 	}
+}
+
+static void handle_dtmf_event(switch_event_t *event)
+{
+	const char *uuid = switch_event_get_header(event, "Unique-ID");
+	const char *digit = switch_event_get_header(event, "DTMF-Digit");
+	cJSON *fields;
+
+	if (zstr(uuid) || zstr(digit)) {
+		return;
+	}
+
+	fields = cJSON_CreateObject();
+	cJSON_AddStringToObject(fields, "dtmf", digit);
+	{
+		const char *duration = switch_event_get_header(event, "DTMF-Duration");
+		if (!zstr(duration)) {
+			cJSON_AddStringToObject(fields, "duration", duration);
+		}
+	}
+	publish_detected(uuid, "dtmf", fields);
+}
+
+/* SWITCH_EVENT_DETECTED_SPEECH -> Event.Detected type=asr. The engine result
+ * rides in the event body (usually JSON, e.g. mod_test/mod_unimrcp emit
+ * {"text":..., "confidence":...}); Speech-Type distinguishes final results
+ * from partial results, begin-speaking and closed. */
+static void handle_speech_event(switch_event_t *event)
+{
+	const char *uuid = switch_event_get_header(event, "Unique-ID");
+	const char *speech_type = switch_event_get_header(event, "Speech-Type");
+	const char *body = zstr(event->body) ? NULL : event->body;
+	cJSON *fields;
+
+	if (zstr(uuid)) {
+		return;
+	}
+
+	fields = cJSON_CreateObject();
+	if (!zstr(speech_type)) {
+		cJSON_AddStringToObject(fields, "speech_type", speech_type);
+	}
+	if (body) {
+		cJSON *json = cJSON_Parse(body);
+		if (json) {
+			cJSON_AddItemToObject(fields, "speech", json);
+		} else {
+			cJSON_AddStringToObject(fields, "text", body);
+		}
+	}
+	publish_detected(uuid, "asr", fields);
 }
 
 /* v0.1: FS core no longer fires a dedicated CDR event; synthesize one from
@@ -429,6 +479,9 @@ static void dispatch_event(switch_event_t *event)
 	case SWITCH_EVENT_DTMF:
 		handle_dtmf_event(event);
 		break;
+	case SWITCH_EVENT_DETECTED_SPEECH:
+		handle_speech_event(event);
+		break;
 	case SWITCH_EVENT_CUSTOM:
 	case SWITCH_EVENT_ALL:
 		handle_native_event(event);
@@ -452,6 +505,7 @@ static int is_channel_event(switch_event_types_t id)
 	case SWITCH_EVENT_CHANNEL_UNBRIDGE:
 	case SWITCH_EVENT_CHANNEL_HANGUP_COMPLETE:
 	case SWITCH_EVENT_DTMF:
+	case SWITCH_EVENT_DETECTED_SPEECH:
 		return 1;
 	default:
 		return 0;
@@ -521,6 +575,12 @@ static switch_event_t *slim_channel_event(switch_event_t *event)
 	if (event->event_id == SWITCH_EVENT_DTMF) {
 		copy_header(dup, event, "DTMF-Digit");
 		copy_header(dup, event, "DTMF-Duration");
+	}
+	if (event->event_id == SWITCH_EVENT_DETECTED_SPEECH) {
+		copy_header(dup, event, "Speech-Type");
+		if (!zstr(event->body)) {
+			switch_event_add_body(dup, "%s", event->body);
+		}
 	}
 	uuid = switch_event_get_header(event, "Unique-ID");
 	global_csv[0] = '\0';
@@ -606,7 +666,8 @@ static const switch_event_types_t MOD_NATS_CHANNEL_EVENTS[] = {
 	SWITCH_EVENT_CHANNEL_BRIDGE,
 	SWITCH_EVENT_CHANNEL_UNBRIDGE,
 	SWITCH_EVENT_CHANNEL_HANGUP_COMPLETE,
-	SWITCH_EVENT_DTMF
+	SWITCH_EVENT_DTMF,
+	SWITCH_EVENT_DETECTED_SPEECH
 };
 
 static switch_status_t bind_events(void)
