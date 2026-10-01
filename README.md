@@ -162,6 +162,11 @@ nats sub 'nats.fs.ctrl.>'       # 信箱：通道事件与 Event.Result
 | `fs.channel.broadcast` | `XNode.Broadcast` | 是 |
 | `fs.channel.record` | `XNode.Record` | 是。`action` RECORD/STOP/PAUSE/RESUME/MASK/UNMASK，`file` 是录音键（STOP 要传同一路径） |
 | `fs.channel.detectspeech` | `XNode.DetectSpeech` | 是。`engine`+`grammar` 启动后台识别（action STOP/PAUSE/RESUME），结果走 `Event.Detected`(type=asr) |
+| `fs.channel.transfer` | `XNode.Transfer` | 是。`dest`（必填）+`dialplan`/`context`，盲转移 |
+| `fs.channel.hold` | `XNode.Hold` | 是。action HOLD/UNHOLD，静默 hold（不向对端广播 MOH） |
+| `fs.channel.mute` | `XNode.Mute` | 是。`mute`（默认 true）/`level` read/write/both |
+| `fs.channel.threeway` | `XNode.ThreeWay` | 是。`b_uuid`：原对端被静默 hold 并记录在绑定上，F 与 b_uuid 桥接 |
+| `fs.channel.unbridge2` | `XNode.UnBridge2` | 是。`b_uuid`+`dest`（必填）：双腿预置 `park_after_bridge` 后转移到 dest，消除拆桥竞态；threeway 挂起的原对端被 unhold |
 | `fs.channel.bridge` | `XNode.Bridge` | 是，两条腿都必须是本 ctrl |
 | `fs.channel.setvar` | `XNode.SetVar` | 是 |
 | `fs.channel.getvar` | `XNode.GetVar` | 是 |
@@ -215,6 +220,8 @@ result.code 语义：200 成功 / 202 已受理（结果走 Event.Result）/ 400
 | XNode.Play / Stop / Broadcast | 放音 / 停止放音 / 广播媒体 |
 | XNode.Record | 通道录音：RECORD/STOP/PAUSE/RESUME/MASK/UNMASK，`file` 为录音键。路径含 `..` 拒绝 |
 | XNode.DetectSpeech | 后台语音识别启停：`engine`/`grammar`/`params`/`dest`，引擎是任何实现了核心 `switch_asr_interface` 的模块（mod_test、mod_pocketsphinx、mod_unimrcp…）。结果以 `Event.Detected`(type=asr) 推送，见下文"ASR 集成" |
+| XNode.Transfer / Hold / Mute | 盲转移（dest 必填）、静默 hold/unhold、媒体 mute/unmute（read/write/both） |
+| XNode.ThreeWay / UnBridge2 | 三方：原对端静默 hold 并记忆，桥入 b_uuid；UnBridge2 双腿预置 `park_after_bridge` 后转移到 dest（必填，建议 answer+park extension）拆散通话并 unhold 原对端 |
 | XNode.Bridge / ChannelBridge | 桥接两条通道 |
 | XNode.SetVar / GetVar / GetState / GetChannelData | 变量与状态读写 |
 | XNode.Dial | 外呼（bgapi originate，立即回 202 + job_uuid，结果走 Event.Result） |
@@ -226,7 +233,7 @@ result.code 语义：200 成功 / 202 已受理（结果走 Event.Result）/ 400
 
 **所有权租约**（`owner-lease-ttl > 0` 时启用）：Accept/Dial 成功即起租；此后每一个成功的 owner 控制请求（含 `fs.channel.touch`）都会把租约顺延一个 ttl。连续 N 秒没有任何 owner 活动，通道绑定被释放并广播 `Event.OwnerLost`（原 owner 信箱 + `event.ownerlost` 公共主题），备用控制器可重新 Accept。外呼尚未 ringing 完成的 uuid（session 还不存在）不会被释放，租约顺延。建议 ttl 大于最长的 Dial 超时。owner 掉线后通道保持运行不受影响，只是控制权回到可接管状态——这是"controller 死了通道还能救"的兜底。
 
-**未实现（规划中）**：UnBridge2、Transfer、Hold、ThreeWay、Mute、Conference 系列、MediaFork。DTMF 与 ASR 已由 `Event.Detected` 事件驱动提供（ASR 见上文两层集成），不再规划阻塞式的 ReadDTMF/DetectSpeech。NativeApp 在通道已被 Accept 后仍可把 dialplan app 排进该通道的会话线程。
+**未实现（规划中）**：Conference 系列、MediaFork。DTMF 与 ASR 已由 `Event.Detected` 事件驱动提供（ASR 见上文两层集成），不再规划阻塞式的 ReadDTMF/DetectSpeech；Transfer/Hold/Mute/ThreeWay/UnBridge2 已实现。NativeApp 在通道已被 Accept 后仍可把 dialplan app 排进该通道的会话线程。
 
 **未 Accept 的通道拒绝控制方法**（400 `channel not accepted`）。`fs.channel.accept` 之后只有 owner 可以控制。`fs.channel.observe` 在 Accept 之前也可以订阅信箱。
 

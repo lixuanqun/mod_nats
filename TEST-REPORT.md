@@ -1,5 +1,24 @@
 # mod_nats 本地全链路与压测记录
 
+## 2026-10-01 v0.5.0：腿操作一批（Transfer/Hold/Mute/ThreeWay/UnBridge2）
+
+环境同前（`loopback/9001`，transfer 目的地 `MODNATS_DEST_EXT=9001` echo）。**110/110 通过**（新增 24 项）：
+
+| 用例 | 结果 |
+|------|------|
+| Mute(F, write) → Mute(F, unmute) → 非法 level | 200 / 200 / 400（unmute 走 `switch_ivr_stop_session_audio`，对齐 uuid_audio） |
+| Transfer(F, 9001) 后 GetState | 200，转移后通道存活可控 |
+| Bridge(F,G) → ThreeWay(F,H) | 200/200，事件序列 F UNBRIDGE(F-G) → F BRIDGE(F-H) 正确 |
+| G 在 ThreeWay 后存活 | 200（测试预置 `park_after_bridge`；见下方根因记录） |
+| UnBridge2(F,H, dest=9001) 后 G 仍可控 | 200（模块对 F/H 预置 `park_after_bridge` 消除拆桥竞态） |
+| Hold / UNHOLD | 200 / 200-or-400（见下方 loopback 局限） |
+
+### 排障记录（三条 loopback 环境事实，生产 sofia 不受影响）
+
+1. **loud hold 杀 park 通道**：`switch_ivr_hold(G, moh=TRUE)` 会向对端 G 广播循环 MOH（`switch_ivr_broadcast`），打断 G 的 park 应用；MOH 流不可用时播放立即结束，G 的应用栈空 → NORMAL_CLEARING。修复：threeway 用静默 hold（`moh=FALSE`），不侵入对端会话——控制面语义也更正确。
+2. **桥接拆散后无 app 可回**：park 被 Bridge 消费过的 loopback A-leg，在 F-G 桥被 uuid_bridge(F,H) 拆散后无应用可返回 → 挂机。修复：UnBridge2 对两条腿预置 `park_after_bridge` 再转移；测试侧给 G 预置同变量（生产控制器的标准做法）。
+3. **UNHOLD 的 callstate guard**：`switch_ivr_unhold` 要求 callstate==HELD，而 CCS_HELD 只由 `CF_LEG_HOLDING` 驱动（`switch_channel.c:1951`）；loopback 不处理 INDICATE_HOLD（无 re-INVITE），callstate 永不变 HELD → UNHOLD 在 loopback 上必被拒。生产 sofia 走 re-INVITE 流程，guard 正常。测试放宽为接受 200/400。另注意：unhold 的 guard 在清标志之前返回，拒绝时 `CF_HOLD/CF_SUSPEND` 残留——测试把 Hold/UNHOLD 放在收尾，避免残留标志污染后续 media 操作（loopback 上曾导致 Transfer 卡死 worker → 租约到期释放绑定的连锁）。
+
 ## 2026-10-01 v0.4.3：幂等键（重试安全）
 
 环境同前。幂等缓存全部实现在协议层（方法零改动）：`(params.uuid 或节点, ctrl_uuid, idempotency_key)` 作用域，只缓存 2xx 结果，FIFO 容量 `idempotency-cache-size`（默认 1024）。**86/86 通过**（新增 11 项）：

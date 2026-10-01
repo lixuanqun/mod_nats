@@ -17,10 +17,11 @@
 #include <nats/nats.h>
 
 #define MOD_NATS_NAME "mod_nats"
-/* Wire protocol version implemented by this module. 2.4.0 adds the owner
+/* Wire protocol version implemented by this module. 2.5.0 adds the owner
  * lease (2.1.0), fs.channel.record + Event.Detected DTMF (2.2.0),
- * fs.channel.detectspeech + type=asr (2.3.0) and idempotency_key replays. */
-#define MOD_NATS_PROTO_VERSION "2.4.0"
+ * fs.channel.detectspeech + type=asr (2.3.0), idempotency_key replays (2.4.0)
+ * and the Transfer/Hold/Mute/ThreeWay/UnBridge2 leg operations. */
+#define MOD_NATS_PROTO_VERSION "2.5.0"
 
 #define MOD_NATS_PREFIX_MAX 64
 #define MOD_NATS_URLS_MAX 1024
@@ -83,6 +84,7 @@ typedef struct mod_nats_obs_s {
 typedef struct mod_nats_chan_s {
 	char uuid[SWITCH_UUID_FORMATTED_LENGTH + 1];
 	char ctrl_uuid[SWITCH_UUID_FORMATTED_LENGTH + 1]; /* "" until Accept */
+	char saved_peer[SWITCH_UUID_FORMATTED_LENGTH + 1]; /* peer held aside by fs.channel.threeway */
 	char *params_csv;				/* per-channel channel_params whitelist */
 	mod_nats_obs_t *observers;
 	uint32_t accept_task_id;		/* scheduler id, 0 when no accept-timeout is armed */

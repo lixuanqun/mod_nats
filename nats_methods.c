@@ -1676,6 +1676,223 @@ static switch_status_t mn_detectspeech(mod_nats_req_ctx_t *ctx, cJSON *params, c
 	return st == SWITCH_STATUS_SUCCESS ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
 }
 
+/* Remember which peer a threeway set aside, so UnBridge2 can find it. */
+static void chan_save_peer(const char *uuid, const char *peer)
+{
+	mod_nats_chan_t *chan;
+
+	if (zstr(uuid)) {
+		return;
+	}
+	switch_mutex_lock(mod_nats_globals.chan_mutex);
+	chan = (mod_nats_chan_t *) switch_core_hash_find(mod_nats_globals.chan_hash, uuid);
+	if (chan) {
+		if (zstr(peer)) {
+			chan->saved_peer[0] = '\0';
+		} else {
+			switch_copy_string(chan->saved_peer, peer, sizeof(chan->saved_peer));
+		}
+	}
+	switch_mutex_unlock(mod_nats_globals.chan_mutex);
+}
+
+/* XNode.Transfer / fs.channel.transfer: move the channel to a dialplan
+ * extension (switch_ivr_session_transfer). */
+static switch_status_t mn_transfer(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *extra)
+{
+	switch_core_session_t *session;
+	cJSON *jdest = cJSON_GetObjectItem(params, "dest");
+	cJSON *jdialplan = cJSON_GetObjectItem(params, "dialplan");
+	cJSON *jcontext = cJSON_GetObjectItem(params, "context");
+	const char *dest = (jdest && cJSON_IsString(jdest) && !zstr(jdest->valuestring)) ? jdest->valuestring : NULL;
+	switch_status_t st;
+	switch_status_t own;
+
+	if ((own = require_owner(ctx, params, extra)) != SWITCH_STATUS_SUCCESS) {
+		return own;
+	}
+	if (!dest) {
+		return SWITCH_STATUS_FALSE;
+	}
+	if (!(session = session_from_params(params, NULL, 0))) {
+		return SWITCH_STATUS_NOTFOUND;
+	}
+	st = switch_ivr_session_transfer(session, dest,
+									 (jdialplan && cJSON_IsString(jdialplan) && !zstr(jdialplan->valuestring)) ? jdialplan->valuestring : NULL,
+									 (jcontext && cJSON_IsString(jcontext) && !zstr(jcontext->valuestring)) ? jcontext->valuestring : NULL);
+	switch_core_session_rwunlock(session);
+	return st == SWITCH_STATUS_SUCCESS ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
+}
+
+/* XNode.Hold / fs.channel.hold: hold or unhold the channel. The channel
+ * itself is addressed; media falls back to MOH while held. */
+static switch_status_t mn_hold(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *extra)
+{
+	cJSON *jaction = cJSON_GetObjectItem(params, "action");
+	const char *action = (jaction && cJSON_IsString(jaction) && !zstr(jaction->valuestring)) ? jaction->valuestring : "HOLD";
+	cJSON *juuid = cJSON_GetObjectItem(params, "uuid");
+	switch_status_t own;
+
+	if ((own = require_owner(ctx, params, extra)) != SWITCH_STATUS_SUCCESS) {
+		return own;
+	}
+	if (!juuid || !cJSON_IsString(juuid) || zstr(juuid->valuestring)) {
+		return SWITCH_STATUS_FALSE;
+	}
+	if (!strcasecmp(action, "UNHOLD")) {
+		return switch_ivr_unhold_uuid(juuid->valuestring) == SWITCH_STATUS_SUCCESS
+				   ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
+	}
+	return switch_ivr_hold_uuid(juuid->valuestring, NULL, SWITCH_TRUE) == SWITCH_STATUS_SUCCESS
+			   ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
+}
+
+/* XNode.Mute / fs.channel.mute: mute or unmute media on the channel
+ * (switch_ivr_session_audio). level: read | write | both (default all→both).
+ * Unmute stops the audio bug entirely, matching uuid_audio's semantics. */
+static switch_status_t mn_mute(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *extra)
+{
+	switch_core_session_t *session;
+	cJSON *jmute = cJSON_GetObjectItem(params, "mute");
+	cJSON *jlevel = cJSON_GetObjectItem(params, "level");
+	const char *level;
+	switch_status_t st;
+	switch_status_t own;
+
+	if ((own = require_owner(ctx, params, extra)) != SWITCH_STATUS_SUCCESS) {
+		return own;
+	}
+	level = (jlevel && cJSON_IsString(jlevel) && !zstr(jlevel->valuestring)) ? jlevel->valuestring : "both";
+	if (strcasecmp(level, "read") && strcasecmp(level, "write") && strcasecmp(level, "both")) {
+		return SWITCH_STATUS_FALSE;
+	}
+	if (!(session = session_from_params(params, NULL, 0))) {
+		return SWITCH_STATUS_NOTFOUND;
+	}
+	if (jmute && cJSON_IsBool(jmute) && jmute->valueint == 0) {
+		st = switch_ivr_stop_session_audio(session);
+	} else {
+		st = switch_ivr_session_audio(session, "mute", level, 0);
+	}
+	switch_core_session_rwunlock(session);
+	return st == SWITCH_STATUS_SUCCESS ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
+}
+
+/* XNode.ThreeWay / fs.channel.threeway: bring b_uuid into the call. The
+ * current partner (if any) is put on hold and remembered on the binding;
+ * UnBridge2 later splits the call and unholds it. */
+static switch_status_t mn_threeway(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *extra)
+{
+	switch_core_session_t *session;
+	cJSON *jb = cJSON_GetObjectItem(params, "b_uuid");
+	char uuid_a[SWITCH_UUID_FORMATTED_LENGTH + 1];
+	const char *peer;
+	switch_status_t st;
+	switch_status_t own;
+
+	if ((own = require_owner(ctx, params, extra)) != SWITCH_STATUS_SUCCESS) {
+		return own;
+	}
+	if (!jb || !cJSON_IsString(jb) || zstr(jb->valuestring)) {
+		return SWITCH_STATUS_FALSE;
+	}
+	if ((own = require_owner_uuid(ctx, extra, jb->valuestring)) != SWITCH_STATUS_SUCCESS) {
+		return own;
+	}
+	if (!(session = session_from_params(params, uuid_a, sizeof(uuid_a)))) {
+		return SWITCH_STATUS_NOTFOUND;
+	}
+	peer = switch_channel_get_partner_uuid(switch_core_session_get_channel(session));
+	if (!zstr(peer)) {
+		/* silent hold: moh=FALSE keeps switch_ivr_hold from broadcasting
+		 * MOH into the peer's session, which would interrupt whatever app
+		 * it is running (park, collect, ...) */
+		switch_ivr_hold_uuid(peer, NULL, SWITCH_FALSE);
+		chan_save_peer(uuid_a, peer);
+	}
+	switch_core_session_rwunlock(session);
+	st = switch_ivr_uuid_bridge(uuid_a, jb->valuestring);
+	if (st != SWITCH_STATUS_SUCCESS) {
+		chan_save_peer(uuid_a, NULL);
+	}
+	return st == SWITCH_STATUS_SUCCESS ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
+}
+
+/* XNode.UnBridge2 / fs.channel.unbridge2: split the call - both legs are
+ * transferred to dest (an extension the deployment provides; typically an
+ * answer+park one) so either can be re-bridged. Both legs are pre-armed
+ * with park_after_bridge so the unbridge cannot tear either down before
+ * its own transfer lands. A peer set aside by threeway is unheld so the
+ * original call can resume. */
+static switch_status_t mn_unbridge2(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *extra)
+{
+	switch_core_session_t *session;
+	cJSON *jb = cJSON_GetObjectItem(params, "b_uuid");
+	cJSON *jdest = cJSON_GetObjectItem(params, "dest");
+	cJSON *jcontext = cJSON_GetObjectItem(params, "context");
+	const char *buuid = (jb && cJSON_IsString(jb) && !zstr(jb->valuestring)) ? jb->valuestring : NULL;
+	const char *dest = (jdest && cJSON_IsString(jdest) && !zstr(jdest->valuestring)) ? jdest->valuestring : NULL;
+	const char *context = (jcontext && cJSON_IsString(jcontext) && !zstr(jcontext->valuestring)) ? jcontext->valuestring : NULL;
+	char saved[SWITCH_UUID_FORMATTED_LENGTH + 1] = "";
+	switch_status_t st;
+	switch_status_t own;
+
+	if ((own = require_owner(ctx, params, extra)) != SWITCH_STATUS_SUCCESS) {
+		return own;
+	}
+	if (!buuid || !dest) {
+		return SWITCH_STATUS_FALSE;
+	}
+	if (!(session = session_from_params(params, NULL, 0))) {
+		return SWITCH_STATUS_NOTFOUND;
+	}
+	/* pre-arm both legs: transferring the first one unbridges the pair, and
+	 * the freed leg must not run a post-bridge hangup before its own
+	 * transfer lands */
+	switch_channel_set_variable(switch_core_session_get_channel(session), "park_after_bridge", "true");
+	switch_core_session_rwunlock(session);
+	{
+		switch_core_session_t *bs = switch_core_session_locate(buuid);
+		if (bs) {
+			switch_channel_set_variable(switch_core_session_get_channel(bs), "park_after_bridge", "true");
+			switch_core_session_rwunlock(bs);
+		}
+	}
+	if (!(session = session_from_params(params, NULL, 0))) {
+		return SWITCH_STATUS_NOTFOUND;
+	}
+	st = switch_ivr_session_transfer(session, dest, NULL, context);
+	switch_core_session_rwunlock(session);
+	if (st != SWITCH_STATUS_SUCCESS) {
+		return SWITCH_STATUS_FALSE;
+	}
+	{
+		switch_core_session_t *bs = switch_core_session_locate(buuid);
+		if (bs) {
+			switch_ivr_session_transfer(bs, dest, NULL, context);
+			switch_core_session_rwunlock(bs);
+		}
+	}
+	{
+		/* recall the peer this module held aside during threeway */
+		cJSON *juuid = cJSON_GetObjectItem(params, "uuid");
+		const char *u = (juuid && cJSON_IsString(juuid)) ? juuid->valuestring : NULL;
+		mod_nats_chan_t *chan;
+
+		switch_mutex_lock(mod_nats_globals.chan_mutex);
+		chan = u ? (mod_nats_chan_t *) switch_core_hash_find(mod_nats_globals.chan_hash, u) : NULL;
+		if (chan) {
+			switch_copy_string(saved, chan->saved_peer, sizeof(saved));
+			chan->saved_peer[0] = '\0';
+		}
+		switch_mutex_unlock(mod_nats_globals.chan_mutex);
+	}
+	if (!zstr(saved) && strcmp(saved, buuid)) {
+		switch_ivr_unhold_uuid(saved);
+	}
+	return SWITCH_STATUS_SUCCESS;
+}
+
 /* Method table: canonical fs.* names with XCC aliases (xctrl SDK compat,
  * gated by the compat-xcc config). Keep names in sync with README. */
 const mod_nats_method_t mod_nats_methods[] = {
@@ -1691,6 +1908,11 @@ const mod_nats_method_t mod_nats_methods[] = {
 	{"fs.channel.broadcast", "XNode.Broadcast", mn_broadcast, SWITCH_TRUE},
 	{"fs.channel.record", "XNode.Record", mn_record, SWITCH_TRUE},
 	{"fs.channel.detectspeech", "XNode.DetectSpeech", mn_detectspeech, SWITCH_TRUE},
+	{"fs.channel.transfer", "XNode.Transfer", mn_transfer, SWITCH_TRUE},
+	{"fs.channel.hold", "XNode.Hold", mn_hold, SWITCH_TRUE},
+	{"fs.channel.mute", "XNode.Mute", mn_mute, SWITCH_TRUE},
+	{"fs.channel.threeway", "XNode.ThreeWay", mn_threeway, SWITCH_TRUE},
+	{"fs.channel.unbridge2", "XNode.UnBridge2", mn_unbridge2, SWITCH_TRUE},
 	{"fs.channel.bridge", "XNode.Bridge", bridge_two, SWITCH_TRUE},
 	{"fs.channel.setvar", "XNode.SetVar", mn_setvar, SWITCH_TRUE},
 	{"fs.channel.getvar", "XNode.GetVar", mn_getvar, SWITCH_TRUE},

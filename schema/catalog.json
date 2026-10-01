@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://freeswitch.org/mod_nats/schema/catalog.json",
   "title": "mod_nats wire catalog",
-  "description": "JSON-RPC 2.0 methods and events for mod_nats protocol 2.4.0. Canonical names are fs.*; XNode.* aliases are accepted when compat-xcc is on. Requests go to {prefix}node.{node_uuid}. Owner and observer events go to {prefix}ctrl.{ctrl_uuid}.",
+  "description": "JSON-RPC 2.0 methods and events for mod_nats protocol 2.5.0. Canonical names are fs.*; XNode.* aliases are accepted when compat-xcc is on. Requests go to {prefix}node.{node_uuid}. Owner and observer events go to {prefix}ctrl.{ctrl_uuid}.",
   "type": "object",
   "$defs": {
     "rpcId": {
@@ -131,6 +131,49 @@
           "description": "Engine parameters applied via switch_ivr_set_param_detect_speech before the grammar loads.",
           "additionalProperties": { "type": "string" }
         }
+      }
+    },
+    "fs.channel.transfer": {
+      "description": "Move the channel to a dialplan extension (switch_ivr_session_transfer). If the channel is bridged, this is a blind transfer: the bridge is left and the peer's fate follows its own hangup_after_bridge/park_after_bridge settings.",
+      "allOf": [{ "$ref": "#/$defs/channelRef" }],
+      "required": ["dest"],
+      "properties": {
+        "dest": { "type": "string", "minLength": 1, "description": "Destination extension." },
+        "dialplan": { "type": "string" },
+        "context": { "type": "string" }
+      }
+    },
+    "fs.channel.hold": {
+      "description": "Hold or unhold the channel (switch_ivr_hold_uuid / switch_ivr_unhold_uuid). Unhold is refused by the core while the callstate is not HELD.",
+      "allOf": [{ "$ref": "#/$defs/channelRef" }],
+      "properties": {
+        "action": { "type": "string", "enum": ["HOLD", "UNHOLD"], "description": "Default HOLD." }
+      }
+    },
+    "fs.channel.mute": {
+      "description": "Mute or unmute media (switch_ivr_session_audio; unmute stops the audio bug entirely).",
+      "allOf": [{ "$ref": "#/$defs/channelRef" }],
+      "properties": {
+        "mute": { "type": "boolean", "description": "Default true. false stops the audio bug." },
+        "level": { "type": "string", "enum": ["read", "write", "both"], "description": "Default both." }
+      }
+    },
+    "fs.channel.threeway": {
+      "description": "Bring b_uuid into the call: the current partner is held silently (no MOH broadcast into its session) and remembered on the binding; UnBridge2 later splits and unholds it. Both legs must be owned by this ctrl.",
+      "allOf": [{ "$ref": "#/$defs/channelRef" }],
+      "required": ["b_uuid"],
+      "properties": {
+        "b_uuid": { "$ref": "#/$defs/uuid" }
+      }
+    },
+    "fs.channel.unbridge2": {
+      "description": "Split the call: both legs are pre-armed with park_after_bridge and transferred to dest so neither is torn down by the unbridge race. A peer set aside by threeway is unheld. dest is required - typically an answer+park extension.",
+      "allOf": [{ "$ref": "#/$defs/channelRef" }],
+      "required": ["b_uuid", "dest"],
+      "properties": {
+        "b_uuid": { "$ref": "#/$defs/uuid" },
+        "dest": { "type": "string", "minLength": 1 },
+        "context": { "type": "string" }
       }
     },
     "fs.channel.broadcast": {

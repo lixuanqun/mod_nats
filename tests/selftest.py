@@ -17,6 +17,9 @@ NATS_URL = os.environ.get("MODNATS_URL", "nats://127.0.0.1:4222")
 # 1000 to answer+park; the docker-lab image maps 1000 to a LiveKit bridge, so
 # point MODNATS_DEST at its echo extension (9196) there.
 DEST = os.environ.get("MODNATS_DEST", "loopback/1000")
+# dialplan extension for XNode.Transfer/UnBridge2 (fs-minimal: 1000 = park;
+# lab: 9001 = echo). Channels must survive the transfer for the assertions.
+DEST_EXT = os.environ.get("MODNATS_DEST_EXT", "1000")
 PREFIX = "nats.fs."
 NODE = "test-node-01"
 CTRL = "test-ctrl-01"
@@ -362,6 +365,59 @@ async def main():
               f"code={out.get('result', {}).get('code') if out else None}")
         await asyncio.sleep(0.5)
         check("Event CDR(B)", find_event("Event.CDR", uuid=ub) is not None, "")
+
+    print("== leg operations: mute / hold / transfer / threeway / unbridge2 ==")
+    # three fresh channels: F (controller), G (first peer), H (third leg)
+    uf = await originate_parked(cli, "F")
+    ug = await originate_parked(cli, "G")
+    uh = await originate_parked(cli, "H")
+    if uf and ug and uh:
+        await cli.req_code("XNode.Accept", {"uuid": uf}, 200, "XNode.Accept(F) -> 200")
+        await cli.req_code("XNode.Accept", {"uuid": ug}, 200, "XNode.Accept(G) -> 200")
+        await cli.req_code("XNode.Accept", {"uuid": uh}, 200, "XNode.Accept(H) -> 200")
+        # G's park app is consumed by Bridge(F,G); keep G alive when threeway
+        # unbridges it (production controllers do the same)
+        await cli.req_code("XNode.SetVar", {"uuid": ug, "data": {"park_after_bridge": "true"}}, 200,
+                           "XNode.SetVar(G,park_after_bridge) -> 200")
+        await cli.req_code("XNode.Mute", {"uuid": uf, "level": "write"}, 200, "XNode.Mute(F,write) -> 200")
+        await cli.req_code("XNode.Mute", {"uuid": uf, "mute": False, "level": "both"}, 200,
+                           "XNode.Mute(F,unmute) -> 200")
+        await cli.req_code("XNode.Mute", {"uuid": uf, "level": "sideways"}, 400,
+                           "XNode.Mute(F,bad level) -> 400")
+        await cli.req_code("XNode.Transfer", {"uuid": uf, "dest": DEST_EXT}, 200,
+                           "XNode.Transfer(F,park ext) -> 200")
+        await cli.req_code("fs.channel.getstate", {"uuid": uf}, 200,
+                           "F alive after transfer -> 200")
+        await cli.req_code("XNode.Bridge", {"uuid": uf, "peer_uuid": ug}, 200, "XNode.Bridge(F,G) -> 200")
+        check("Bridge(F,G) BRIDGE event", await wait_for(
+            lambda: find_event("Event.Channel", uuid=uf, state="BRIDGE")
+            or find_event("Event.Channel", uuid=ug, state="BRIDGE")), "")
+        await cli.req_code("XNode.ThreeWay", {"uuid": uf, "b_uuid": uh}, 200, "XNode.ThreeWay(F,H) -> 200")
+        check("ThreeWay re-bridge F<->H", await wait_for(
+            lambda: find_event("Event.Channel", uuid=uh, state="BRIDGE")
+            or find_event("Event.Channel", uuid=uf, state="BRIDGE")), "")
+        # G was held silently (moh=FALSE): it must NOT have been torn down by
+        # the MOH broadcast the loud hold would fire into its session
+        await cli.req_code("fs.channel.getstate", {"uuid": ug}, 200,
+                           "G alive after ThreeWay silent hold -> 200")
+        await cli.req_code("XNode.UnBridge2", {"uuid": uf, "b_uuid": uh, "dest": DEST_EXT}, 200,
+                           "XNode.UnBridge2(F,H) -> 200")
+        await cli.req_code("fs.channel.getstate", {"uuid": ug}, 200,
+                           "G still controllable after UnBridge2 -> 200")
+        # hold last: on loopback the core never drives callstate to HELD, so
+        # UNHOLD's guard refuses and CF_HOLD/CF_SUSPEND stay set - keep that
+        # residue away from the media operations above
+        await cli.req_code("XNode.Hold", {"uuid": uf}, 200, "XNode.Hold(F) -> 200")
+        await asyncio.sleep(0.5)
+        out = await cli.req("XNode.Hold", {"uuid": uf, "action": "UNHOLD"})
+        check("XNode.Hold(F,UNHOLD) [200, or 400 on loopback: callstate never HELD]",
+              out is not None and out.get("result", {}).get("code") in (200, 400),
+              f"code={out.get('result', {}).get('code') if out else None}")
+        for u, tag in ((uf, "F"), (ug, "G"), (uh, "H")):
+            out = await cli.req("XNode.Hangup", {"uuid": u})
+            check(f"XNode.Hangup({tag}) [ok if 200/400/404]",
+                  out is not None and out.get("result", {}).get("code") in (200, 400, 404),
+                  f"code={out.get('result', {}).get('code') if out else None}")
 
     print("== XNode.Dial (async originate) ==")
     uc = str(uuidlib.uuid4())
