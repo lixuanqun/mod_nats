@@ -1,0 +1,9 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: mod_nats
+Source: https://github.com/lixuanqun/mod_nats
+
+Files: *
+Copyright: 2026 lixuanqun
+License: MPL-1.1
+ mod_nats is distributed under the Mozilla Public License Version 1.1,
+ consistent with the FreeSWITCH licensing under which it links.

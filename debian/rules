@@ -1,0 +1,29 @@
+#!/usr/bin/make -f
+# Build mod_nats out-of-tree against an installed FreeSWITCH development
+# environment. The module sources are compiled directly with the same flags
+# the in-tree build uses; pkg-config discovers both libnats and FreeSWITCH.
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+%:
+	dh $@
+
+# pkg-config names differ between FreeSWITCH builds (freeswitch.pc ships
+# with the official packages); fall back to the include/lib layout used by
+# source installs under /usr/local/freeswitch.
+FS_CFLAGS := $(shell pkg-config --cflags freeswitch 2>/dev/null || echo -I/usr/local/freeswitch/include/freeswitch)
+FS_LIBS   := $(shell pkg-config --libs freeswitch 2>/dev/null || echo -L/usr/local/freeswitch/lib -lfreeswitch)
+NATS_CFLAGS := $(shell pkg-config --cflags libnats 2>/dev/null || pkg-config --cflags nats 2>/dev/null)
+NATS_LIBS   := $(shell pkg-config --libs libnats 2>/dev/null || pkg-config --libs nats 2>/dev/null || echo -lnats)
+
+override_dh_auto_build:
+	gcc $(CFLAGS) $(CPPFLAGS) -shared -fPIC -O2 \
+	    $(FS_CFLAGS) $(NATS_CFLAGS) \
+	    mod_nats.c nats_conn.c nats_proto.c nats_methods.c nats_events.c \
+	    $(FS_LIBS) $(NATS_LIBS) -lpthread \
+	    -o mod_nats.so
+
+override_dh_auto_install:
+	install -D -m 755 mod_nats.so \
+	    debian/mod-nats/usr/lib/freeswitch/mod/mod_nats.so
+	install -D -m 644 nats.conf.xml \
+	    debian/mod-nats/etc/freeswitch/autoload_configs/nats.conf.xml

@@ -1,0 +1,17 @@
+mod-nats (0.5.0-1) unstable; urgency=medium
+
+  * Ownership lease with fs.channel.touch and Event.OwnerLost takeover.
+  * fs.channel.record / XNode.Record session recordings.
+  * Event.Detected: DTMF forwarding and layer-1 ASR results
+    (fs.channel.detectspeech / XNode.DetectSpeech).
+  * Idempotency keys for retry-safe control requests.
+  * Leg operations: Transfer, Hold, Mute, ThreeWay, UnBridge2.
+  * Go SDK under sdk/go.
+
+ -- lixuanqun <lixuanqun@users.noreply.github.com>  Thu, 01 Oct 2026 12:00:00 +0000
+
+mod-nats (0.4.0-1) unstable; urgency=medium
+
+  * Initial Debian packaging.
+
+ -- lixuanqun <lixuanqun@users.noreply.github.com>  Tue, 30 Sep 2026 12:00:00 +0000

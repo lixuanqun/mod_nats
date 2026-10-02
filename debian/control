@@ -1,0 +1,22 @@
+Source: mod-nats
+Section: comm
+Priority: optional
+Maintainer: lixuanqun <lixuanqun@users.noreply.github.com>
+Build-Depends:
+ debhelper-compat (= 13),
+ pkg-config,
+ libnats-dev (>= 3.0),
+ freeswitch-dev (>= 1.10) | libfreeswitch-dev
+Standards-Version: 4.6.2
+Homepage: https://github.com/lixuanqun/mod_nats
+Rules-Requires-Root: no
+
+Package: mod-nats
+Architecture: any
+Depends: ${misc:Depends}, ${shlibs:Depends}, freeswitch (>= 1.10) | freeswitch-all
+Description: NATS message bus control plane for FreeSWITCH
+ mod_nats gives FreeSWITCH a NATS-bus control plane: JSON-RPC 2.0 call
+ control (Accept/Answer/Hangup/Play/Record/DetectSpeech/Transfer/Hold/
+ ThreeWay/...), channel events, CDR and metrics publishing, with media
+ staying on FreeSWITCH. XNode.* aliases are compatible with the XCC
+ protocol; ESL is untouched and stays the ops channel.
