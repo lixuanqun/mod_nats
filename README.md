@@ -1,5 +1,21 @@
 # mod_nats 模块设计文档
 
+> **English summary** — mod_nats gives vanilla FreeSWITCH a NATS-bus control
+> plane: JSON-RPC 2.0 call control (Accept, Answer, Hangup, Play, Record,
+> DetectSpeech, Transfer, Hold, Mute, ThreeWay, UnBridge2, Dial...), channel
+> events, DTMF/ASR detection events, CDR and metrics publishing. Media stays
+> on FreeSWITCH; only control and text ride the bus. The wire protocol is
+> XCC-compatible (`XNode.*` aliases; set `subject-prefix` to `cn.xswitch.`
+> for drop-in use of the official xctrl SDKs), with a Go SDK under
+> [sdk/go](sdk/go/README.md) and a wire catalog in
+> [schema/catalog.json](schema/catalog.json). Production semantics include
+> an owner lease with standby takeover (`Event.OwnerLost`), idempotency
+> keys for retry-safe requests, per-class persistence (JetStream for CDR/
+> metrics, at-most-once core NATS for call events) and bounded queues that
+> never block the FS core. ESL stays untouched as the ops channel. Full
+> documentation is in Chinese below; start with [架构](#1-架构),
+> [集成步骤](#3-集成步骤) and the [deployment guide](docs/DEPLOYMENT.md).
+
 NATS 消息总线集成模块。为 FreeSWITCH 提供通用的呼叫控制面、通道事件与 CDR 发布：任意外部系统通过 NATS 上的 JSON-RPC 接入，媒体留在 FreeSWITCH，控制走总线。控制协议与 XSwitch XCC 兼容，官方 XCtrl 可以作为客户端接入，自研的 Java、Go 或其他语言客户端按同一套主题和方法接入。
 
 控制面的思路来自 XSwitch 的开源项目 [XCtrl](https://github.com/xswitch-cn/xctrl) 和 [XCC 协议](https://docs.xswitch.cn/xcc-api/design/)。致谢见 [第 11 节](#11-致谢)。

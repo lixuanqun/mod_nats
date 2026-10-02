@@ -1,5 +1,18 @@
 # mod_nats 本地全链路与压测记录
 
+## 2026-10-01 v0.5.0：呼叫路径压测（Go SDK churn 工具）
+
+工具：`sdk/go/examples/churn`（基于自家 Go SDK——顺带验证 SDK 在持续负载下工作）。每通呼叫全链路：Dial(202) → 等 ANSWERED → Play → Hangup → 等 DESTROY，记录 dial→answered 延迟。环境同前（loopback/9001，6 worker × 50 通 = 300 通）：
+
+| 项目 | 结果 |
+|------|------|
+| 成功率 | 300/300 answered，0 失败 |
+| 吞吐 | 14.3 CPS（20.9s 完成；含每通 Play + Hangup + 全事件订阅） |
+| dial→answered 延迟 | p50 5.9ms，p95 36.0ms，p99 39.3ms，max 40.2ms |
+| 压测后 `nats status` | dropped=0，pub errors=0，events out 5613 |
+
+loopback 的 CPS 不能当作外部 SIP 容量（与 2026-09-29 轮同样注明），但它验证了控制面在持续呼叫churn下的端到端延迟与零丢失。控制面纯 RPC 基线见下方 2026-09-29 轮（JStatus ~9.6k rps, p99 6.4ms）。真实 SIP 中继的容量测量需要在有中继的环境跑同一工具（改 `MODNATS_DEST`），工具本身已就位。
+
 ## 2026-10-01 v0.5.0：腿操作一批（Transfer/Hold/Mute/ThreeWay/UnBridge2）
 
 环境同前（`loopback/9001`，transfer 目的地 `MODNATS_DEST_EXT=9001` echo）。**110/110 通过**（新增 24 项）：
