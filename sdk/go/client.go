@@ -144,7 +144,8 @@ func randToken() string {
 // GetVar's "data"). The ctrl_uuid is stamped automatically; with
 // WithAutoIdempotency a fresh idempotency_key is added unless params
 // already carries one.
-func (c *Client) Request(ctx context.Context, method string, params map[string]interface{}, extra interface{}) (*Result, error) {	if params == nil {
+func (c *Client) Request(ctx context.Context, method string, params map[string]interface{}, extra interface{}) (*Result, error) {
+	if params == nil {
 		params = map[string]interface{}{}
 	}
 	if _, ok := params["ctrl_uuid"]; !ok && c.ctrlUUID != "" {
@@ -187,9 +188,10 @@ func (c *Client) Request(ctx context.Context, method string, params map[string]i
 	return res, nil
 }
 
-// request runs Request with the client timeout. Methods use this form.
-func (c *Client) request(method string, params map[string]interface{}, extra interface{}) (*Result, error) {
-	ctx, cancel := c.requestCtx(nil)
+// request runs Request with the caller context merged with the client
+// timeout. Methods pass their ctx through; nil falls back to Background.
+func (c *Client) request(ctx context.Context, method string, params map[string]interface{}, extra interface{}) (*Result, error) {
+	ctx, cancel := c.requestCtx(ctx)
 	defer cancel()
 	return c.Request(ctx, method, params, extra)
 }

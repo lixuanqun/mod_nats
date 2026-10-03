@@ -8,14 +8,14 @@ import (
 
 // Event types published by mod_nats.
 const (
-	EventChannel    = "Event.Channel"
-	EventCDR        = "Event.CDR"
-	EventDetected   = "Event.Detected"
-	EventMetrics    = "Event.Metrics"
-	EventNodeUp     = "Event.NodeUp"
-	EventOwnerLost  = "Event.OwnerLost"
-	EventResult     = "Event.Result"
-	EventNative     = "Event.NativeEvent"
+	EventChannel   = "Event.Channel"
+	EventCDR       = "Event.CDR"
+	EventDetected  = "Event.Detected"
+	EventMetrics   = "Event.Metrics"
+	EventNodeUp    = "Event.NodeUp"
+	EventOwnerLost = "Event.OwnerLost"
+	EventResult    = "Event.Result"
+	EventNative    = "Event.NativeEvent"
 )
 
 // Channel states carried by Event.Channel params.state.
@@ -33,9 +33,9 @@ const (
 // "params":{...}}. Decode Params into the typed structs below or into a
 // map for forward compatibility.
 type Event struct {
-	Method string          `json:"method"`
-	Params json.RawMessage `json:"params"`
-	Subject string         `json:"-"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params"`
+	Subject string          `json:"-"`
 }
 
 // ChannelEvent is Event.Channel: a call state transition. All fields are
@@ -102,17 +102,17 @@ type OwnerLost struct {
 
 // NodeStatus is Event.Metrics / XNode.JStatus data / Event.NodeUp payload.
 type NodeStatus struct {
-	SystemStatus string  `json:"systemStatus,omitempty"`
-	Uptime       float64 `json:"uptime,omitempty"`
-	Version      string  `json:"version,omitempty"`
-	Sessions     float64 `json:"sessions,omitempty"`
-	SessionsPeak float64 `json:"sessions_peak,omitempty"`
-	SessionsMax  float64 `json:"sessions_max,omitempty"`
-	SPS          float64 `json:"sps,omitempty"`
-	SPSPeak      float64 `json:"sps_peak,omitempty"`
-	NodeUUID     string  `json:"node_uuid,omitempty"`
-	ProtoVersion string  `json:"proto_version,omitempty"`
-	SubjectPrefix string `json:"subject_prefix,omitempty"`
+	SystemStatus  string  `json:"systemStatus,omitempty"`
+	Uptime        float64 `json:"uptime,omitempty"`
+	Version       string  `json:"version,omitempty"`
+	Sessions      float64 `json:"sessions,omitempty"`
+	SessionsPeak  float64 `json:"sessions_peak,omitempty"`
+	SessionsMax   float64 `json:"sessions_max,omitempty"`
+	SPS           float64 `json:"sps,omitempty"`
+	SPSPeak       float64 `json:"sps_peak,omitempty"`
+	NodeUUID      string  `json:"node_uuid,omitempty"`
+	ProtoVersion  string  `json:"proto_version,omitempty"`
+	SubjectPrefix string  `json:"subject_prefix,omitempty"`
 }
 
 // Parse decodes the event params into one of the typed structs. Supported
@@ -191,14 +191,24 @@ func (c *Client) SubscribeMailbox(handler func(*Event)) (*nats.Subscription, err
 // controllers; production code usually keeps its own event loop.
 func (c *Client) WaitOwned(uuid string, states ...string) (*Event, error) {
 	ch := make(chan *Event, 64)
-	sub1, err := c.SubscribeEvents(func(e *Event) { select { case ch <- e: default: } })
+	sub1, err := c.SubscribeEvents(func(e *Event) {
+		select {
+		case ch <- e:
+		default:
+		}
+	})
 	if err != nil {
 		return nil, err
 	}
 	defer sub1.Unsubscribe()
 	var sub2 *nats.Subscription
 	if c.ctrlUUID != "" {
-		sub2, err = c.SubscribeMailbox(func(e *Event) { select { case ch <- e: default: } })
+		sub2, err = c.SubscribeMailbox(func(e *Event) {
+			select {
+			case ch <- e:
+			default:
+			}
+		})
 		if err != nil {
 			return nil, err
 		}

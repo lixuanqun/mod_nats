@@ -71,7 +71,7 @@ accounts {
 
 ## 5. 安全清单
 
-- 总线启用 TLS（nats-server `-tls` + 模块编译 libnats 时带 `NATS_BUILD_WITH_TLS=ON`，客户端配 `credentials` 或 user/pass）。
-- `allow-native-api` 保持默认关闭；开了等于把 fs_cli 交给总线上任何有凭据的人。
+- 传输安全：**模块侧目前没有 TLS 配置**，连接总是明文——不要把总线跨不可信网络。把 NATS 放在与 FS 同一可信网段，或用 leaf node/站点隧道加密跨网段链路；跨机房的 leaf 连接走 leaf 的 TLS（加密发生在 leaf↔中心之间，FS↔leaf 这一段保持在本网段内）。认证用 `credentials`（NKey 挑战签名，明文链路上不重放口令）优于 `user`/`password`。
+- `allow-native-api` 保持默认关闭；开了等于把 fs_cli 交给总线上任何有凭据的人。`NativeApp` 即使在它关闭时也可用（owner 才能调用），但 `system`/`bg_system` 一律 403。
 - `accept-timeout` 打开（例如 15s），防止无人认领的入向呼叫永久占资源。
-- Dial 的注入面已封（`execute_on_*`/`api_hangup_hook` 黑名单），但仍建议 NATS 权限收窄到只有控制器账号能发 `node.>`。
+- 注入面已封：`Dial` 的 `dial_string`/`global_params`、`SetVar` 的变量名都套 `execute_on_*`/`api_on_*`/`api_hangup_hook`/`exec_after_*` 黑名单；`NativeApp` 拒绝 shell 执行类应用。但仍建议 NATS 权限收窄到只有控制器账号能发 `node.>`。

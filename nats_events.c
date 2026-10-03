@@ -461,6 +461,17 @@ static void handle_native_event(switch_event_t *event)
 static void dispatch_event(switch_event_t *event)
 {
 	switch (event->event_id) {
+	case SWITCH_EVENT_CHANNEL_DESTROY:
+	{
+		/* queued by the event handler as a minimal marker; the binding is
+		 * dropped only after HANGUP_COMPLETE ahead of it was dispatched */
+		const char *uuid = switch_event_get_header(event, "Unique-ID");
+
+		if (!zstr(uuid)) {
+			mod_nats_methods_unregister_channel(uuid);
+		}
+		break;
+	}
 	case SWITCH_EVENT_CHANNEL_CREATE:
 	case SWITCH_EVENT_CHANNEL_PROGRESS:
 	case SWITCH_EVENT_CHANNEL_PROGRESS_MEDIA:
@@ -468,12 +479,9 @@ static void dispatch_event(switch_event_t *event)
 	case SWITCH_EVENT_CHANNEL_BRIDGE:
 	case SWITCH_EVENT_CHANNEL_UNBRIDGE:
 	case SWITCH_EVENT_CHANNEL_HANGUP_COMPLETE:
-	case SWITCH_EVENT_CHANNEL_DESTROY:
-		if (event->event_id != SWITCH_EVENT_CHANNEL_DESTROY) {
-			handle_channel_event(event);
-			if (event->event_id == SWITCH_EVENT_CHANNEL_HANGUP_COMPLETE) {
-				handle_cdr_event(event);
-			}
+		handle_channel_event(event);
+		if (event->event_id == SWITCH_EVENT_CHANNEL_HANGUP_COMPLETE) {
+			handle_cdr_event(event);
 		}
 		break;
 	case SWITCH_EVENT_DTMF:
@@ -604,10 +612,29 @@ static void event_handler(switch_event_t *event)
 {
 	switch_event_t *dup = NULL;
 
-	if (!mod_nats_globals.running || !mod_nats_globals.enable_events || !event) {
+	if (!mod_nats_globals.running || !event) {
 		return;
 	}
 	if (event->event_id == SWITCH_EVENT_LOG) {
+		return;
+	}
+	if (event->event_id == SWITCH_EVENT_CHANNEL_DESTROY) {
+		/* Second-chance unbind. HANGUP_COMPLETE normally drops the binding
+		 * after publishing, but it rides the at-most-once queue and can be
+		 * dropped under load; a leaked binding would keep the uuid claimed
+		 * forever. DESTROY is carried as a minimal marker through the same
+		 * queue, so it stays ordered behind HANGUP_COMPLETE and the owner
+		 * still receives the terminal event before the binding is dropped. */
+		const char *uuid = switch_event_get_header(event, "Unique-ID");
+		switch_event_t *mark = NULL;
+
+		if (!zstr(uuid) && mod_nats_globals.event_queue &&
+			switch_event_create(&mark, SWITCH_EVENT_CHANNEL_DESTROY) == SWITCH_STATUS_SUCCESS) {
+			switch_event_add_header_string(mark, SWITCH_STACK_BOTTOM, "Unique-ID", uuid);
+			if (switch_queue_trypush(mod_nats_globals.event_queue, mark) != SWITCH_STATUS_SUCCESS) {
+				switch_event_destroy(&mark);
+			}
+		}
 		return;
 	}
 	if (is_channel_event(event->event_id)) {
@@ -666,6 +693,7 @@ static const switch_event_types_t MOD_NATS_CHANNEL_EVENTS[] = {
 	SWITCH_EVENT_CHANNEL_BRIDGE,
 	SWITCH_EVENT_CHANNEL_UNBRIDGE,
 	SWITCH_EVENT_CHANNEL_HANGUP_COMPLETE,
+	SWITCH_EVENT_CHANNEL_DESTROY,
 	SWITCH_EVENT_DTMF,
 	SWITCH_EVENT_DETECTED_SPEECH
 };

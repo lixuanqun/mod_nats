@@ -199,6 +199,12 @@ async def main():
     if out:
         check("GetChannelData uuid", out.get("result", {}).get("data", {}).get("uuid") == ua, "")
 
+    # hardening: dangerous variables refused at SetVar, shell apps at NativeApp
+    await cli.req_code("XNode.SetVar", {"uuid": ua, "data": {"execute_on_answer": "echo pwned"}}, 400,
+                       "XNode.SetVar(forbidden var) -> 400")
+    await cli.req_code("XNode.NativeApp", {"uuid": ua, "cmd": "system", "args": "true"}, 403,
+                       "XNode.NativeApp(system) -> 403 (shell apps refused)")
+
     # force state transitions via the escape hatch
     await cli.req_code("XNode.NativeApp", {"uuid": ua, "cmd": "ring_ready"}, 200,
                        "XNode.NativeApp(A,ring_ready) -> 200")

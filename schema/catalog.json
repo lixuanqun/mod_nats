@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://freeswitch.org/mod_nats/schema/catalog.json",
   "title": "mod_nats wire catalog",
-  "description": "JSON-RPC 2.0 methods and events for mod_nats protocol 2.5.0. Canonical names are fs.*; XNode.* aliases are accepted when compat-xcc is on. Requests go to {prefix}node.{node_uuid}. Owner and observer events go to {prefix}ctrl.{ctrl_uuid}.",
+  "description": "JSON-RPC 2.0 methods and events for mod_nats protocol 2.5.1. Canonical names are fs.*; XNode.* aliases are accepted when compat-xcc is on. Requests go to {prefix}node.{node_uuid}. Owner and observer events go to {prefix}ctrl.{ctrl_uuid}.",
   "type": "object",
   "$defs": {
     "rpcId": {
@@ -45,7 +45,7 @@
       "properties": {
         "code": {
           "type": "integer",
-          "description": "200 OK, 202 accepted, 400 refused, 404 no channel, 419 owned by someone else, 480 dial failed, 500 internal, 501 unknown method, 503 queue full."
+          "description": "200 OK, 202 accepted, 400 refused, 403 disabled or not allowed, 404 no channel, 419 owned by someone else, 480 dial failed, 500 internal, 501 unknown method, 503 queue full."
         },
         "message": { "type": "string" },
         "node_uuid": { "type": "string" },
@@ -197,7 +197,8 @@
       "properties": {
         "data": {
           "type": "object",
-          "additionalProperties": { "type": "string" }
+          "additionalProperties": { "type": "string" },
+          "description": "Variable names in the Dial forbidden set (execute_on_*, api_on_*, api_hangup_hook, exec_after_*) are refused with code 400 before the session is touched."
         }
       }
     },
@@ -217,7 +218,11 @@
       "allOf": [{ "$ref": "#/$defs/channelRef" }],
       "required": ["cmd"],
       "properties": {
-        "cmd": { "type": "string", "minLength": 1 },
+        "cmd": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Dialplan application queued onto the session thread. Shell-exec apps (system, bg_system) are refused with code 403; fs.native.api (allow-native-api) is the intended escape hatch."
+        },
         "args": { "type": "string" }
       }
     },
@@ -328,6 +333,15 @@
     "Event.Metrics": {
       "description": "Same object as fs.node.status, wrapped as a notification on {prefix}metrics.",
       "type": "object"
+    },
+    "Event.NativeEvent": {
+      "description": "Raw FreeSWITCH event forwarded when publish-native-events is on. params.event carries every event header; the subject is {prefix}event.{event name lowercased}. SWITCH_EVENT_LOG is never forwarded.",
+      "type": "object",
+      "required": ["node_uuid", "event"],
+      "properties": {
+        "node_uuid": { "type": "string" },
+        "event": { "type": "object", "description": "Event header name -> value." }
+      }
     },
     "Event.NodeUp": {
       "description": "Same object as the fs.node.hello result data field. Published on {prefix}event.nodeup at load.",

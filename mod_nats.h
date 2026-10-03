@@ -20,8 +20,10 @@
 /* Wire protocol version implemented by this module. 2.5.0 adds the owner
  * lease (2.1.0), fs.channel.record + Event.Detected DTMF (2.2.0),
  * fs.channel.detectspeech + type=asr (2.3.0), idempotency_key replays (2.4.0)
- * and the Transfer/Hold/Mute/ThreeWay/UnBridge2 leg operations. */
-#define MOD_NATS_PROTO_VERSION "2.5.0"
+ * and the Transfer/Hold/Mute/ThreeWay/UnBridge2 leg operations. 2.5.1
+ * hardens the control surface: fs.native.app refuses shell-exec apps and
+ * fs.channel.setvar applies the same forbidden-variable filter as Dial. */
+#define MOD_NATS_PROTO_VERSION "2.5.1"
 
 #define MOD_NATS_PREFIX_MAX 64
 #define MOD_NATS_URLS_MAX 1024
@@ -103,7 +105,6 @@ struct mod_nats_globals_s {
 	char *user;
 	char *password;
 	char *credentials;
-	switch_bool_t tls_verify;
 	switch_bool_t allow_native_api;	/* fs.native.api / fs.native.jsapi, default off */
 	char *cdr_subject;				/* default "<prefix>cdr" */
 	switch_bool_t enable_events;

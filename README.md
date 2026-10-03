@@ -76,7 +76,7 @@ NATS 消息总线集成模块。为 FreeSWITCH 提供通用的呼叫控制面、
 
    服务端默认 `max_payload` 是 1MB。模块自身拒绝大于 1MiB 的 RPC。若要把这条限制测到，把服务端上限调到大于 1MiB（例如 4MB）。默认 1MB 时，过大的请求会被客户端或服务端在到达模块之前丢掉。
 
-2. **安装 libnats。** 需要 [nats.c](https://github.com/nats-io/nats.c) >= 3.0。启用 TLS 时用 `-DNATS_BUILD_WITH_TLS=ON` 编译。安装后系统里要有 `libnats.pc` 或 `nats.pc`，`pkg-config --modversion libnats`（或 `nats`）至少是 3.0。
+2. **安装 libnats。** 需要 [nats.c](https://github.com/nats-io/nats.c) >= 3.0。安装后系统里要有 `libnats.pc` 或 `nats.pc`，`pkg-config --modversion libnats`（或 `nats`）至少是 3.0。注意：模块侧目前没有 TLS 连接配置（见[已知限制](#10-已知限制)），libnats 用 `-DNATS_BUILD_WITH_TLS=OFF` 构建即可。
 
 3. **放进 FreeSWITCH 源码树并编译。** 把本仓库放到 `src/mod/event_handlers/mod_nats`。这里的 `Makefile.am` 用 pkg-config 直接找 libnats，不依赖 FreeSWITCH `configure.ac` 里的检测。然后：
 
@@ -212,7 +212,7 @@ nats sub 'nats.fs.ctrl.>'       # 信箱：通道事件与 Event.Result
  "params":{"node_uuid":"...","uuid":"...","state":"ANSWERED","caller_id_number":"1000",...}}
 ```
 
-result.code 语义：200 成功 / 202 已受理（结果走 Event.Result）/ 400 拒绝 / 404 通道不存在 / 419 已被其他控制器接管 / 500 内部错误 / 501 未实现。
+result.code 语义：200 成功 / 202 已受理（结果走 Event.Result）/ 400 拒绝 / 403 功能关闭或不允许 / 404 通道不存在 / 419 已被其他控制器接管 / 500 内部错误 / 501 未实现。
 
 ### 幂等键（重试安全）
 
@@ -253,7 +253,7 @@ result.code 语义：200 成功 / 202 已受理（结果走 Event.Result）/ 400
 
 **未 Accept 的通道拒绝控制方法**（400 `channel not accepted`）。`fs.channel.accept` 之后只有 owner 可以控制。`fs.channel.observe` 在 Accept 之前也可以订阅信箱。
 
-`fs.native.api` / `fs.native.jsapi` 默认关闭，配置 `allow-native-api=true` 才放行。`Dial` 的 `global_params` 和 `dial_string` 里如果出现 `execute_on_*`、`api_on_*`、`api_hangup_hook`、`exec_after_*`，整次外呼返回 400。
+`fs.native.api` / `fs.native.jsapi` 默认关闭，配置 `allow-native-api=true` 才放行。`Dial` 的 `global_params` 和 `dial_string` 里如果出现 `execute_on_*`、`api_on_*`、`api_hangup_hook`、`exec_after_*`，整次外呼返回 400；`setvar` 对变量名套用同一张黑名单。`NativeApp` 拒绝 `system` / `bg_system`（403）——shell 执行只属于受 `allow-native-api` 门控的 `NativeAPI` 路径。
 
 外呼在 `originate` 之前用 `origination_uuid` 占住 owner。失败或卸载时会释放这个绑定。
 
@@ -309,7 +309,7 @@ fsctl> nats reload    # 重读配置
 
 ## 7. 编译
 
-依赖：[nats.c](https://github.com/nats-io/nats.c) >= 3.0（JetStream API 在 `nats.h` 中，没有单独的 `NATS_HAS_JETSTREAM` 宏）。启用 TLS 时加 `-DNATS_HAS_TLS` 构建 libnats。本仓库的 `Makefile.am` 通过 pkg-config 发现依赖，优先 `libnats.pc`，没有则回退 `nats.pc`。
+依赖：[nats.c](https://github.com/nats-io/nats.c) >= 3.0（JetStream API 在 `nats.h` 中，没有单独的 `NATS_HAS_JETSTREAM` 宏）。模块不使用 TLS 连接，libnats 无需启用 TLS 构建。本仓库的 `Makefile.am` 通过 pkg-config 发现依赖，优先 `libnats.pc`，没有则回退 `nats.pc`。
 
 ```bash
 # 安装 libnats（Linux 示例）
@@ -366,7 +366,8 @@ nats stream add FS_METRICS --subjects 'nats.fs.metrics' --storage file --default
 - 租约到期只释放绑定并广播 `Event.OwnerLost`，不挂机、不改变通道状态。若 ttl 小于 Dial 时长，originate 期间可能发出一次多余的 OwnerLost，随后 Dial 完成时 owner 重新登记。把 ttl 配得比最长 Dial 超时大即可避免。
 - `reload mod_nats` 是模块级重载：通道绑定与幂等缓存一并清空。重载后的重试不再命中缓存，可能重复执行——控制器侧的重试窗口应避开模块重载，或把重载当作故障转移事件处理。
 - 未 Accept 的通道不能执行控制方法。`fs.native.api` / `fs.native.jsapi` 默认关闭。
-- `global_params` 会写成 originate 变量，但 `execute_on_*` / `api_on_*` / `api_hangup_hook` / `exec_after_*` 会被拒绝。
+- **模块侧目前没有 TLS 支持**：`nats.conf.xml` 没有 TLS 参数，连接总是明文（cnats 即使以 `NATS_BUILD_WITH_TLS=ON` 构建，本模块也不会启用它）。生产部署要么把总线放在可信网段/leaf 隧道内，要么在模块实现 TLS 配置前不要让总线跨不可信网络；认证用 `credentials`（JWT/NKey 挑战签名）优于 `user`/`password`。
+- `global_params` 会写成 originate 变量，但 `execute_on_*` / `api_on_*` / `api_hangup_hook` / `exec_after_*` 会被拒绝。`setvar` 套用同一张黑名单。
 - 需要 libnats >= 3.0 才能编译。Windows 工程（.vcxproj）未创建。
 - `nats reload` 会重绑事件订阅并应用运行期开关。连接 URL、前缀、node-uuid、账号和队列长度保持加载时的值，要改这些需要重启模块。JetStream 上下文一旦绑上就不会拆。
 - 通道事件在独立线程里序列化，只复制白名单头部。`publish-native-events` 关闭时只绑定通道状态事件，不再订阅 `SWITCH_EVENT_ALL`。打开后仍丢弃 `SWITCH_EVENT_LOG`，避免日志回流。`XNode.NativeApp` 返回 200 表示应用已排队，不表示应用已经结束。

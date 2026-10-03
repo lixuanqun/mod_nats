@@ -106,6 +106,15 @@ jobs:
           go vet ./...
           go test ./...
 
+  wire-catalog:
+    name: "Wire catalog drift check"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Check method table / catalog / docs agreement
+        run: python3 tests/check_catalog.py
+
   package-deb:
     name: "Package .deb (runtime bundle)"
     needs: build-linux

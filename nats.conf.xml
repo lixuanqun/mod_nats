@@ -35,6 +35,8 @@
          replays the stored result. 0 disables. -->
     <param name="idempotency-cache-size" value="1024"/>
     <!-- fs.native.api and fs.native.jsapi; keep false unless the bus is trusted -->
+    <!-- fs.native.api and fs.native.jsapi; keep false unless the bus is trusted.
+         NativeApp stays available to owners but always refuses system/bg_system. -->
     <param name="allow-native-api" value="false"/>
     <!-- Event.Metrics period in seconds; 0 disables. Subject is {prefix}metrics -->
     <param name="metrics-interval" value="0"/>

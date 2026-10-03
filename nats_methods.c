@@ -769,6 +769,8 @@ static switch_status_t bridge_two(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON 
 	return switch_ivr_uuid_bridge(uuid_a, jpeer->valuestring);
 }
 
+static int origin_var_forbidden(const char *s);
+
 static switch_status_t mn_setvar(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *extra)
 {
 	switch_core_session_t *session;
@@ -782,6 +784,17 @@ static switch_status_t mn_setvar(mod_nats_req_ctx_t *ctx, cJSON *params, cJSON *
 	}
 	if (!data || !cJSON_IsObject(data)) {
 		return SWITCH_STATUS_FALSE;
+	}
+	/* same forbidden set as Dial's global_params: a controller must not arm
+	 * execute_on_* / api_on_* hooks through a channel variable */
+	cJSON_ArrayForEach(item, data) {
+		if (item->string && origin_var_forbidden(item->string)) {
+			if (extra) {
+				cJSON_AddNumberToObject(extra, "code", 400);
+				cJSON_AddStringToObject(extra, "message", "forbidden channel variable");
+			}
+			return SWITCH_STATUS_FALSE;
+		}
 	}
 	if (!(session = session_from_params(params, NULL, 0))) {
 		return SWITCH_STATUS_NOTFOUND;
@@ -920,6 +933,15 @@ static switch_status_t mn_nativeapp(mod_nats_req_ctx_t *ctx, cJSON *params, cJSO
 	}
 	cmd = jcmd->valuestring;
 	args = (jargs && cJSON_IsString(jargs)) ? jargs->valuestring : "";
+	/* shell-exec applications are refused regardless of the ownership gate;
+	 * fs.native.api (allow-native-api) is the intended escape hatch */
+	if (!strcasecmp(cmd, "system") || !strcasecmp(cmd, "bg_system")) {
+		if (extra) {
+			cJSON_AddNumberToObject(extra, "code", 403);
+			cJSON_AddStringToObject(extra, "message", "application not allowed over the bus");
+		}
+		return SWITCH_STATUS_FALSE;
+	}
 	if (strlen(cmd) + strlen(switch_str_nil(args)) + 3 >= sizeof(spec)) {
 		return SWITCH_STATUS_FALSE;
 	}

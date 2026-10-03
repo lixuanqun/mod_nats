@@ -298,6 +298,20 @@ static switch_status_t api_status(switch_stream_handle_t *stream)
 	stream->write_function(stream, "events out    %lu\n", (unsigned long) ev);
 	stream->write_function(stream, "dropped       %lu\n", (unsigned long) dropped);
 	stream->write_function(stream, "pub errors    %lu\n", (unsigned long) errs);
+	{
+		/* cnats drops inbound messages silently once the subscription's
+		 * pending limits are hit; surface its cumulative counter */
+		natsSubscription *sub;
+		int64_t sub_dropped = 0;
+
+		switch_mutex_lock(mod_nats_globals.mutex);
+		sub = mod_nats_globals.sub_node;
+		switch_mutex_unlock(mod_nats_globals.mutex);
+		if (sub) {
+			natsSubscription_GetDropped(sub, &sub_dropped);
+		}
+		stream->write_function(stream, "sub dropped   %ld\n", (long) sub_dropped);
+	}
 	stream->write_function(stream, "dial          workers=%d queued=%u\n",
 						   mod_nats_globals.dial_thread_count,
 						   mod_nats_globals.dial_queue ? switch_queue_size(mod_nats_globals.dial_queue) : 0);

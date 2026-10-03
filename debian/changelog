@@ -1,3 +1,20 @@
+mod-nats (0.5.1-1) unstable; urgency=medium
+
+  * Security hardening: fs.native.app refuses shell-exec apps (system,
+    bg_system) with 403; fs.channel.setvar applies the same forbidden-
+    variable filter as Dial (execute_on_*, api_on_*, api_hangup_hook,
+    exec_after_*).
+  * CHANNEL_DESTROY now drops the channel binding as a second chance after
+    HANGUP_COMPLETE, so a dropped event cannot leak a claimed binding.
+  * Inbound subscription drop counter (cnats pending limits) surfaced in
+    `nats status` as `sub dropped`.
+  * Docs state honestly that module-side TLS is not implemented.
+  * Go SDK: caller context now reaches the wire request (ctx was silently
+    ignored); all methods pass cancellation and deadlines through.
+  * Wire catalog drift check (tests/check_catalog.py) runs in CI.
+
+ -- lixuanqun <lixuanqun@users.noreply.github.com>  Sat, 03 Oct 2026 12:00:00 +0000
+
 mod-nats (0.5.0-1) unstable; urgency=medium
 
   * Ownership lease with fs.channel.touch and Event.OwnerLost takeover.
